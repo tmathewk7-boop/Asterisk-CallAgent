@@ -26,8 +26,15 @@ from pathlib import Path
 from twilio.rest import Client as TwilioClient
 import pyttsx3   # fallback local TTS
 
+import openai
+from typing import Optional
+
 load_dotenv()
 
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+AI_MIN_RESPONSE_INTERVAL = float(os.getenv("AI_MIN_RESPONSE_INTERVAL", "3"))
+AI_MAX_RESPONSE_TOKENS = int(os.getenv("AI_MAX_RESPONSE_TOKENS", "512"))
 TWILIO_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+1XXXX")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://example.ngrok.io")  # your webhook base URL
 PORT = int(os.getenv("PORT", 8000))
@@ -38,6 +45,18 @@ ELEVEN_VOICE_ID = os.getenv("ELEVEN_VOICE_ID")      # optional
 STATIC_DIR = Path("./static")
 TTS_DIR = STATIC_DIR / "tts"
 TTS_DIR.mkdir(parents=True, exist_ok=True)
+
+if OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+else:
+    print("Warning: OPENAI_API_KEY not set. LLM auto-response disabled.")
+
+# track last AI reply time per call to avoid spamming
+last_ai_reply_time: Dict[str, float] = defaultdict(lambda: 0.0)
+
+# simple short-term conversation memory per call (keeps recent messages)
+# for demo purposes; you can persist this to DB for multi-turn context
+call_history: Dict[str, list] = defaultdict(list)
 
 twilio_client = None
 if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
@@ -201,16 +220,14 @@ async def process_and_transcribe(call_sid: str, pcm_bytes: bytes):
     """
     Convert raw PCM bytes to a temporary WAV file and run Whisper to transcribe.
     Then send transcript to dashboard.
+    Also: automatically call LLM -> synthesize TTS -> instruct Twilio to play it.
     """
-    # Twilio sends 16-bit signed PCM LE. We don't always know sample rate: common is 8kHz for telephony.
-    # For higher accuracy use 16kHz if your Twilio MediaStream is configured to 16kHz.
     sample_rate = int(os.getenv("TWILIO_SAMPLE_RATE", "8000"))
     channels = 1
     sampwidth = 2  # bytes per sample for 16-bit audio
 
-    # write raw PCM to a temporary WAV using pydub
+    # build AudioSegment and export to WAV
     try:
-        # build AudioSegment from raw PCM
         audio = AudioSegment(
             data=pcm_bytes,
             sample_width=sampwidth,
@@ -224,18 +241,70 @@ async def process_and_transcribe(call_sid: str, pcm_bytes: bytes):
         print("Failed to assemble audio chunk:", e)
         return
 
-    # run whisper transcription (blocking, so run in thread via asyncio.to_thread)
+    # run whisper transcription
     try:
         print(f"Transcribing chunk for {call_sid}, file={wav_path}")
         result = await asyncio.to_thread(whisper_model.transcribe, wav_path, {"language": "en"})
         text = result.get("text", "").strip()
         print("Transcript:", text)
-        await notify_dashboard({
-            "event": "transcript",
-            "callSid": call_sid,
-            "text": text,
-            "timestamp": int(time.time())
-        })
+        if text:
+            await notify_dashboard({
+                "event": "transcript",
+                "callSid": call_sid,
+                "text": text,
+                "timestamp": int(time.time())
+            })
+
+            # --- AUTOMATIC LLM RESPONSE PATH ---
+            # You may want to filter out short fillers like "um" or "okay" — simple length check:
+            if len(text) >= 3:  # minimal length filter
+                # generate AI reply
+                ai_reply = await generate_ai_response(call_sid, text)
+                if ai_reply:
+                    await notify_dashboard({
+                        "event": "ai_reply_generated",
+                        "callSid": call_sid,
+                        "text": ai_reply,
+                        "timestamp": int(time.time())
+                    })
+
+                    # synthesize TTS and get public URL
+                    tts_url = await synthesize_tts_and_get_url(call_sid, ai_reply)
+                    if tts_url:
+                        # instruct Twilio to play TTS into live call by updating TwiML
+                        try:
+                            twiml_play = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>{tts_url}</Play>
+</Response>"""
+                            if twilio_client:
+                                # Use Twilio REST to update live call
+                                try:
+                                    twilio_client.calls(call_sid).update(twiml=twiml_play)
+                                    await notify_dashboard({
+                                        "event": "ai_play_started",
+                                        "callSid": call_sid,
+                                        "tts_url": tts_url,
+                                        "timestamp": int(time.time())
+                                    })
+                                except Exception as e:
+                                    print("Error updating Twilio call with TTS:", e)
+                                    await notify_dashboard({
+                                        "event": "ai_play_failed",
+                                        "callSid": call_sid,
+                                        "error": str(e),
+                                        "timestamp": int(time.time())
+                                    })
+                            else:
+                                print("Twilio client not configured; cannot play TTS.")
+                        except Exception as e:
+                            print("Error while preparing TTS play:", e)
+                    else:
+                        print("TTS synthesis failed; skipping playback.")
+        else:
+            # empty transcript — ignore
+            pass
+
     except Exception as e:
         print("Whisper transcription error:", e)
     finally:
@@ -243,6 +312,7 @@ async def process_and_transcribe(call_sid: str, pcm_bytes: bytes):
             Path(wav_path).unlink(missing_ok=True)
         except Exception:
             pass
+
 
 # ========== Basic health route & quick test page ==========
 @app.get("/")
@@ -393,6 +463,57 @@ async def handle_play_tts_cmd(call_sid: str, text: str):
     except Exception as e:
         print("play_tts error", e)
         await notify_dashboard({"event":"ai_play_failed","callSid":call_sid,"error":str(e)})
+
+async def generate_ai_response(call_sid: str, user_text: str) -> Optional[str]:
+    """
+    Call OpenAI ChatCompletion (synchronous wrapped in to_thread)
+    Returns reply text or None on failure.
+    Adds the exchange to call_history for lightweight multi-turn.
+    """
+    if not OPENAI_API_KEY:
+        return None
+
+    # Simple cost-limiting / spam-protection
+    now = time.time()
+    if now - last_ai_reply_time.get(call_sid, 0) < AI_MIN_RESPONSE_INTERVAL:
+        # skip response to avoid spamming
+        return None
+
+    # Build chat messages: lightweight two-turn buffer
+    history = call_history[call_sid][-6:]  # keep last 6 messages (each message is dict role/text)
+    # append latest user message
+    history.append({"role": "user", "content": user_text})
+    # Build messages for API: you can include a system prompt to instruct agent behavior
+    messages = [{"role": "system", "content":
+                 "You are a concise, helpful phone assistant for a business. Keep replies short (1-2 sentences) and speak clearly. Avoid asking many clarifying questions."}]
+    for m in history:
+        messages.append({"role": m["role"], "content": m["content"]})
+
+    try:
+        # Use asyncio.to_thread to avoid blocking event loop
+        def call_openai():
+            resp = openai.ChatCompletion.create(
+                model=OPENAI_MODEL,
+                messages=messages,
+                max_tokens=AI_MAX_RESPONSE_TOKENS,
+                temperature=0.1,
+            )
+            # get text from first choice
+            return resp.choices[0].message["content"].strip()
+
+        reply_text = await asyncio.to_thread(call_openai)
+
+        # record into history (assistant reply)
+        call_history[call_sid].append({"role": "user", "content": user_text})
+        call_history[call_sid].append({"role": "assistant", "content": reply_text})
+
+        # update last reply time
+        last_ai_reply_time[call_sid] = time.time()
+        return reply_text
+    except Exception as e:
+        print("OpenAI call failed:", e)
+        return None
+
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
