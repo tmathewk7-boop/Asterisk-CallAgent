@@ -17,7 +17,7 @@ import soundfile as sf
 import numpy as np
 
 # Audio processing
-from pydub import AudioSegment
+
 import pyttsx3  # local TTS fallback
 
 # Twilio
