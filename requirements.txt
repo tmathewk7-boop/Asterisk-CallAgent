@@ -7,3 +7,4 @@ requests>=2.31.0
 pyttsx3>=2.90
 numpy>=1.26.0
 soundfile>=0.12.1
+
