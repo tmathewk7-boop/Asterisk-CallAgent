@@ -13,6 +13,9 @@ from fastapi.responses import PlainTextResponse, HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
+import soundfile as sf
+import numpy as np
+
 # Audio processing
 from pydub import AudioSegment
 import pyttsx3  # local TTS fallback
