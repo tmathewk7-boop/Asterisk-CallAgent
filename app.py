@@ -1,289 +1,238 @@
+# main.py
 import os
-import sqlite3
+import base64
+import asyncio
 import json
 import tempfile
-import requests
-from flask import Flask, request, jsonify, send_file, abort
+import time
+from pathlib import Path
+from typing import Dict, Any
+from collections import defaultdict
+
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import PlainTextResponse, HTMLResponse
+from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 from dotenv import load_dotenv
-from datetime import datetime
 
-# Load env
+# ASR: whisper
+import whisper
+from pydub import AudioSegment
+import numpy as np
+
 load_dotenv()
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-OPENAI_CHAT_MODEL = os.getenv("OPENAI_CHAT_MODEL", "gpt-4o-mini")
-OPENAI_TTS_MODEL = os.getenv("OPENAI_TTS_MODEL", "tts-1")
-SERVER_API_KEY = os.getenv("SERVER_API_KEY", None)
-DB_FILE = os.getenv("DATABASE_FILE", "ai_calls.db")
 
-if SERVER_API_KEY is None:
-    raise RuntimeError("SERVER_API_KEY must be set in environment")
+TWILIO_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+1XXXX")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "https://example.ngrok.io")  # your webhook base URL
+PORT = int(os.getenv("PORT", 8000))
 
-app = Flask(__name__)
+app = FastAPI()
+app.add_middleware(
+    CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+)
 
-from gpt4all import GPT4All
+# In-memory buffers keyed by callSid
+# Each buffer will be list of raw PCM frames (bytes)
+audio_buffers: Dict[str, bytearray] = defaultdict(bytearray)
+last_activity: Dict[str, float] = {}
 
-# Load the GPT4All model (downloads once)
-gpt_model = GPT4All("./models/ggml-gpt4all-lora-quantized.bin", allow_download=False)
-  # You can choose another model if needed
+# dashboard websocket manager (single dashboard connection assumed for simplicity)
+dashboard_ws: WebSocket | None = None
+dashboard_lock = asyncio.Lock()
 
-def free_ai_chat(prompt, system=None):
+# load whisper model (choose "small" for demo; change to "tiny"/"base" for speed)
+print("Loading Whisper model (this can take time)...")
+whisper_model = whisper.load_model(os.getenv("WHISPER_MODEL", "small"))
+print("Whisper loaded.")
+
+# ========== Twilio webhook to answer incoming DID call ==========
+# Configure your Twilio phone number webhook (Voice -> Webhook) to POST to PUBLIC_URL + /twilio/incoming
+@app.post("/twilio/incoming")
+async def twilio_incoming(request: Request):
     """
-    Replacement for openai_chat — fully free, local AI.
+    Twilio will POST here when a call arrives on your DID.
+    We return TwiML that instructs Twilio to <Stream> the call audio to our WebSocket /media-ws.
     """
+    form = await request.form()
+    from_number = form.get("From")
+    call_sid = form.get("CallSid")
+    print("Incoming call from", from_number, "CallSid", call_sid)
+
+    # TwiML response to start a Media Stream to our websocket server
+    # Twilio expects text/xml
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Say voice="alice">Please hold while we connect to the AI assistant.</Say>
+  <Start>
+    <Stream url="wss://{(PUBLIC_URL).replace('https://','').replace('http://','')}/media-ws"/>
+  </Start>
+  <Pause length="3600"/>
+</Response>"""
+    # notify dashboard
+    await notify_dashboard({
+        "event": "call_started",
+        "from": from_number,
+        "callSid": call_sid,
+        "timestamp": int(time.time())
+    })
+    return PlainTextResponse(content=twiml, media_type="text/xml")
+
+
+# ========== WebSocket endpoint Twilio Media Streams will connect to ==========
+@app.websocket("/media-ws")
+async def media_ws_endpoint(ws: WebSocket):
+    """
+    Accept Twilio Media Streams WebSocket connection.
+    Twilio sends control messages (connected, start, media frames).
+    See Twilio Media Streams docs for the JSON message formats. :contentReference[oaicite:7]{index=7}
+    """
+    await ws.accept()
+    print("Media WebSocket connected (Twilio Media Streams).")
+    call_sid = None
     try:
-        if system:
-            prompt = system + "\n\n" + prompt
-        response = gpt_model.generate(prompt)
-        return response, {"model":"gpt4all"}
-    except Exception as e:
-        return f"ERROR: {e}", {"error": str(e)}
+        while True:
+            msg = await ws.receive_text()
+            data = json.loads(msg)
+            # Twilio sends event 'start' with details
+            event = data.get("event")
+            if event == "start":
+                # connection start metadata
+                stream_sid = data.get("start", {}).get("streamSid")
+                call_sid = data.get("start", {}).get("callSid")
+                print("Stream started", stream_sid, "callSid", call_sid)
+                last_activity[call_sid] = time.time()
+            elif event == "media":
+                # media.payload is base64 of raw audio (encoding: base64-encoded 16-bit signed PCM little-endian, 8kHz or 16kHz depending on Twilio settings)
+                payload_b64 = data["media"]["payload"]
+                pcm = base64.b64decode(payload_b64)
+                # append to buffer for this call
+                if call_sid is None:
+                    # try callSid in top-level if provided
+                    call_sid = data.get("callSid", call_sid)
+                audio_buffers[call_sid] += pcm
+                last_activity[call_sid] = time.time()
+
+                # simple heuristic: when enough audio accumulated, trigger async transcription
+                if len(audio_buffers[call_sid]) > (16000 * 2 * 5):  # e.g., ~5s at 16kHz, 16-bit
+                    # grab buffer and empty
+                    pcm_chunk = bytes(audio_buffers[call_sid])
+                    audio_buffers[call_sid].clear()
+                    asyncio.create_task(process_and_transcribe(call_sid, pcm_chunk))
+            elif event == "stop":
+                # Twilio indicates stream stopped — flush remaining audio
+                print("Stream stopped for callSid", call_sid)
+                if call_sid and len(audio_buffers[call_sid]) > 0:
+                    pcm_chunk = bytes(audio_buffers[call_sid])
+                    audio_buffers[call_sid].clear()
+                    await process_and_transcribe(call_sid, pcm_chunk)
+                await notify_dashboard({"event": "call_ended", "callSid": call_sid, "timestamp": int(time.time())})
+            else:
+                # other events
+                pass
+    except WebSocketDisconnect:
+        print("Media WebSocket disconnected.")
 
 
-# ----------------------------
-# DB helpers
-# ----------------------------
-def init_db():
-    conn = sqlite3.connect(DB_FILE)
-    cur = conn.cursor()
-    # customers table: username, phone, agent_prompt (JSON/text)
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS customers (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT UNIQUE,
-        phone TEXT,
-        agent_prompt TEXT,
-        created_at TEXT
-    )
-    """)
-    # calls table to store call logs
-    cur.execute("""
-    CREATE TABLE IF NOT EXISTS calls (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        username TEXT,
-        caller TEXT,
-        direction TEXT,
-        transcription TEXT,
-        ai_response TEXT,
-        summary TEXT,
-        raw_json TEXT,
-        created_at TEXT
-    )
-    """)
-    conn.commit()
-    conn.close()
-
-def db_conn():
-    conn = sqlite3.connect(DB_FILE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-init_db()
-
-# ----------------------------
-# Auth decorator (API key)
-# ----------------------------
-from functools import wraps
-def require_api_key(fn):
-    @wraps(fn)
-    def wrapper(*a, **kw):
-        key = None
-        # prefer Authorization header Bearer <key>
-        auth = request.headers.get("Authorization", "")
-        if auth.startswith("Bearer "):
-            key = auth.split(" ", 1)[1].strip()
-        if not key:
-            key = request.headers.get("X-API-KEY") or request.args.get("api_key")
-        if key != SERVER_API_KEY:
-            return jsonify({"error": "unauthorized"}), 401
-        return fn(*a, **kw)
-    return wrapper
-
-# ----------------------------
-# OpenAI helpers
-# ----------------------------
-def openai_chat(prompt, system=None):
+# ========== Dashboard WebSocket endpoint ==========
+@app.websocket("/dashboard-ws")
+async def dashboard_ws_endpoint(ws: WebSocket):
+    """
+    Your .exe dashboard connects here (ws://yourserver:8000/dashboard-ws).
+    It receives JSON messages like: call_started, transcript, call_ended.
+    It can also send control messages back (not implemented fully here).
+    """
+    global dashboard_ws
+    await ws.accept()
+    print("Dashboard connected.")
+    async with dashboard_lock:
+        dashboard_ws = ws
     try:
-        url = "https://api.openai.com/v1/chat/completions"
-        headers = {"Authorization": f"Bearer {OPENAI_API_KEY}"}
-        messages = []
-        if system:
-            messages.append({"role":"system", "content": system})
-        messages.append({"role":"user", "content": prompt})
-        payload = {
-            "model": OPENAI_CHAT_MODEL,
-            "messages": messages,
-            "temperature": 0.2,
-            "max_tokens": 512
-        }
-        r = requests.post(url, headers=headers, json=payload, timeout=30)
-        r.raise_for_status()
-        data = r.json()
-        return data["choices"][0]["message"]["content"], data
-    except Exception as e:
-        return f"ERROR: {e}", {"error": str(e)}
+        while True:
+            msg = await ws.receive_text()
+            print("Dashboard -> backend:", msg)
+            # you might accept controls like {"cmd":"hangup","callSid":"..."}
+            try:
+                obj = json.loads(msg)
+                if obj.get("cmd") == "hangup":
+                    # implement hangup via Twilio REST if needed
+                    pass
+            except Exception:
+                pass
+    except WebSocketDisconnect:
+        print("Dashboard disconnected.")
+    finally:
+        async with dashboard_lock:
+            if dashboard_ws == ws:
+                dashboard_ws = None
 
-def openai_tts(text):
+
+async def notify_dashboard(payload: Dict[str, Any]):
     """
-    Returns path to MP3 temporary file, or None on error.
+    Send JSON payload to dashboard if connected.
     """
+    global dashboard_ws
+    if dashboard_ws is None:
+        return
     try:
-        url = "https://api.openai.com/v1/audio/speech"
-        headers = {
-            "Authorization": f"Bearer {OPENAI_API_KEY}",
-            "Content-Type": "application/json"
-        }
-        payload = {
-            "model": OPENAI_TTS_MODEL,
-            "voice": "alloy",
-            "input": text,
-            "response_format": "mp3"
-        }
-        r = requests.post(url, headers=headers, json=payload, timeout=60)
-        r.raise_for_status()
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-        tmp.write(r.content)
-        tmp.close()
-        return tmp.name
+        await dashboard_ws.send_text(json.dumps(payload))
     except Exception as e:
-        app.logger.exception("TTS failed")
-        return None
+        print("Error sending to dashboard:", e)
 
-# ----------------------------
-# Routes
-# ----------------------------
-@app.route("/")
-def home():
-    return {"status":"ai-call-server", "time": datetime.utcnow().isoformat()}
 
-@app.route("/status")
-@require_api_key
-def status():
-    # lightweight status
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT COUNT(*) as c FROM calls")
-    calls_count = cur.fetchone()["c"]
-    conn.close()
-    return {"status":"ok","calls_stored": calls_count}
+# ========== Transcription helper ==========
+async def process_and_transcribe(call_sid: str, pcm_bytes: bytes):
+    """
+    Convert raw PCM bytes to a temporary WAV file and run Whisper to transcribe.
+    Then send transcript to dashboard.
+    """
+    # Twilio sends 16-bit signed PCM LE. We don't always know sample rate: common is 8kHz for telephony.
+    # For higher accuracy use 16kHz if your Twilio MediaStream is configured to 16kHz.
+    sample_rate = int(os.getenv("TWILIO_SAMPLE_RATE", "8000"))
+    channels = 1
+    sampwidth = 2  # bytes per sample for 16-bit audio
 
-# Register or update a customer
-@app.route("/register-customer", methods=["POST"])
-@require_api_key
-def register_customer():
-    payload = request.json or {}
-    username = payload.get("username")
-    phone = payload.get("phone")
-    agent_prompt = payload.get("agent_prompt", "")
-    if not username:
-        return jsonify({"error":"username required"}), 400
-
-    conn = db_conn()
-    cur = conn.cursor()
-    now = datetime.utcnow().isoformat()
+    # write raw PCM to a temporary WAV using pydub
     try:
-        cur.execute("INSERT OR REPLACE INTO customers (username, phone, agent_prompt, created_at) VALUES ((SELECT username FROM customers WHERE username=?), ?, ?, ?)",
-                    (username, phone, agent_prompt, now))
-        conn.commit()
+        # build AudioSegment from raw PCM
+        audio = AudioSegment(
+            data=pcm_bytes,
+            sample_width=sampwidth,
+            frame_rate=sample_rate,
+            channels=channels
+        )
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            wav_path = tf.name
+            audio.export(wav_path, format="wav")
     except Exception as e:
-        # fallback insert/update manual
-        cur.execute("SELECT id FROM customers WHERE username=?", (username,))
-        row = cur.fetchone()
-        if row:
-            cur.execute("UPDATE customers SET phone=?, agent_prompt=?, created_at=? WHERE username=?", (phone, agent_prompt, now, username))
-        else:
-            cur.execute("INSERT INTO customers (username, phone, agent_prompt, created_at) VALUES (?, ?, ?, ?)", (username, phone, agent_prompt, now))
-        conn.commit()
-    conn.close()
-    return jsonify({"status":"ok", "username": username})
+        print("Failed to assemble audio chunk:", e)
+        return
 
-# List calls (filter by username optional)
-@app.route("/calls", methods=["GET"])
-@require_api_key
-def list_calls():
-    username = request.args.get("username")
-    conn = db_conn()
-    cur = conn.cursor()
-    if username:
-        cur.execute("SELECT * FROM calls WHERE username=? ORDER BY id DESC LIMIT 200", (username,))
-    else:
-        cur.execute("SELECT * FROM calls ORDER BY id DESC LIMIT 200")
-    rows = [dict(r) for r in cur.fetchall()]
-    conn.close()
-    return jsonify({"calls": rows})
+    # run whisper transcription (blocking, so run in thread via asyncio.to_thread)
+    try:
+        print(f"Transcribing chunk for {call_sid}, file={wav_path}")
+        result = await asyncio.to_thread(whisper_model.transcribe, wav_path, {"language": "en"})
+        text = result.get("text", "").strip()
+        print("Transcript:", text)
+        await notify_dashboard({
+            "event": "transcript",
+            "callSid": call_sid,
+            "text": text,
+            "timestamp": int(time.time())
+        })
+    except Exception as e:
+        print("Whisper transcription error:", e)
+    finally:
+        try:
+            Path(wav_path).unlink(missing_ok=True)
+        except Exception:
+            pass
 
-# Simulate a call (useful for testing before buying DID)
-@app.route("/simulate-call", methods=["POST"])
-@require_api_key
-def simulate_call():
-    payload = request.json or {}
-    username = payload.get("username")
-    caller = payload.get("from", "test-caller")
-    message = payload.get("message", "")
-    # lookup prompt for customer
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT agent_prompt FROM customers WHERE username=?", (username,))
-    row = cur.fetchone()
-    agent_prompt = row["agent_prompt"] if row else ""
-    # simple system prompt fallback
-    system_prompt = agent_prompt or "You are a helpful customer-facing AI assistant. Keep replies short and professional."
-    ai_text, raw = openai_chat(message, system=system_prompt)
-    # persist call
-    now = datetime.utcnow().isoformat()
-    cur.execute("INSERT INTO calls (username, caller, direction, transcription, ai_response, raw_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (username, caller, "inbound", message, ai_text, json.dumps(raw), now))
-    conn.commit()
-    call_id = cur.lastrowid
-    conn.close()
-    return jsonify({"call_id": call_id, "ai_response": ai_text})
 
-# Webhook endpoint for voice providers (Twilio/SignalWire)
-@app.route("/call", methods=["POST"])
-@require_api_key
-def incoming_call():
-    """
-    This endpoint expects provider to POST JSON with:
-    {
-      "username": "<customer assigned to DID>",
-      "from": "<caller number>",
-      "audio_url": "<optional: recorded audio url or streaming token>",
-      "transcription": "<optional: pre-transcribed text>",
-      ...
-    }
-    If transcription provided we use it; otherwise you can implement logic to download audio and send to Whisper (TODO).
-    """
-    payload = request.json or {}
-    username = payload.get("username")
-    caller = payload.get("from")
-    transcription = payload.get("transcription")
-    message = transcription or payload.get("message") or ""
-    # get agent prompt
-    conn = db_conn()
-    cur = conn.cursor()
-    cur.execute("SELECT agent_prompt FROM customers WHERE username=?", (username,))
-    row = cur.fetchone()
-    agent_prompt = row["agent_prompt"] if row else ""
-    system_prompt = agent_prompt or "You are a friendly, concise assistant."
-    ai_text, raw = openai_chat(message, system=system_prompt)
-    now = datetime.utcnow().isoformat()
-    cur.execute("INSERT INTO calls (username, caller, direction, transcription, ai_response, raw_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                (username, caller, "inbound", message, ai_text, json.dumps(raw), now))
-    conn.commit()
-    call_id = cur.lastrowid
-    conn.close()
-    # Optionally generate TTS and return URL or serve audio stream
-    tts_path = openai_tts(ai_text)
-    if tts_path:
-        # send file back in response as attachment (provider may expect URL instead)
-        return send_file(tts_path, mimetype="audio/mpeg", as_attachment=False, download_name=f"response_{call_id}.mp3")
-    else:
-        return jsonify({"ai_response": ai_text})
-
-# Simple healthcheck
-@app.route("/health")
-def health():
-    return jsonify({"status":"ok", "time": datetime.utcnow().isoformat()})
-
+# ========== Basic health route & quick test page ==========
+@app.get("/")
+async def index():
+    return HTMLResponse("<h3>Voice Engine running. Connect your dashboard to /dashboard-ws</h3>")
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
+
