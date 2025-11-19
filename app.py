@@ -23,7 +23,8 @@ app = Flask(__name__)
 from gpt4all import GPT4All
 
 # Load the GPT4All model (downloads once)
-gpt_model = GPT4All("ggml-gpt4all-j-v1.3-groovy")  # You can choose another model if needed
+gpt_model = GPT4All("ggml-gpt4all-lora-quantized.bin")
+  # You can choose another model if needed
 
 def free_ai_chat(prompt, system=None):
     """
