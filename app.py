@@ -20,6 +20,24 @@ if SERVER_API_KEY is None:
 
 app = Flask(__name__)
 
+from gpt4all import GPT4All
+
+# Load the GPT4All model (downloads once)
+gpt_model = GPT4All("ggml-gpt4all-j-v1.3-groovy")  # You can choose another model if needed
+
+def free_ai_chat(prompt, system=None):
+    """
+    Replacement for openai_chat — fully free, local AI.
+    """
+    try:
+        if system:
+            prompt = system + "\n\n" + prompt
+        response = gpt_model.generate(prompt)
+        return response, {"model":"gpt4all"}
+    except Exception as e:
+        return f"ERROR: {e}", {"error": str(e)}
+
+
 # ----------------------------
 # DB helpers
 # ----------------------------
