@@ -9,3 +9,4 @@ numpy==1.26.2
 twilio==8.5.0
 requests==2.31.0
 pyttsx3==2.90
+openai>=0.28.0
