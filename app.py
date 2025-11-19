@@ -265,5 +265,29 @@ def incoming_call():
 def health():
     return jsonify({"status":"ok", "time": datetime.utcnow().isoformat()})
 
+import requests
+API_URL = "https://your-render-url"
+API_KEY = "the-same-server-api-key"
+
+headers = {"Authorization": f"Bearer {API_KEY}"}
+
+# register customer
+requests.post(f"{API_URL}/register-customer", json={
+    "username":"alice",
+    "phone":"+1-555-1111",
+    "agent_prompt":"You are Alice's receptionist. Be brief."
+}, headers=headers)
+
+# simulate call
+r = requests.post(f"{API_URL}/simulate-call", json={
+    "username":"alice",
+    "from":"+1555123456",
+    "message":"Hi, I want pricing info"
+}, headers=headers)
+print(r.json())
+
+r = requests.get(f"{API_URL}/calls?username=alice", headers=headers)
+calls = r.json().get("calls", [])
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
