@@ -68,7 +68,7 @@ async def twilio_incoming(request: Request):
 <Response>
   <Say voice="alice">Connecting you to the AI assistant.</Say>
   <Start>
-    <Stream url="wss://https://asterisk-callagent.onrender.com/media-ws"/>
+    <Stream url="wss://asterisk-callagent.onrender.com/media-ws"/>
   </Start>
   <Pause length="3600"/>
 </Response>"""
