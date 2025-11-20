@@ -53,6 +53,10 @@ import pyttsx3  # local TTS fallback
 # Twilio
 from twilio.rest import Client as TwilioClient
 
+from gtts import gTTS
+from functools import partial
+from asyncio import get_running_loop
+
 # ========== ENVIRONMENT VARIABLES ==========
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
@@ -250,15 +254,15 @@ def safe_filename(call_sid: str, text: str) -> str:
     return f"{call_sid}_{ts}_{h}.wav"
 
 async def synthesize_tts_and_get_url(call_sid: str, text: str) -> str | None:
-    fname = safe_filename(call_sid, text)
+    fname = safe_filename(call_sid, text).replace(".wav", ".mp3")
     out_path = TTS_DIR / fname
+
+    loop = get_running_loop()
     try:
-        engine = pyttsx3.init()
-        engine.save_to_file(text, str(out_path))
-        engine.runAndWait()
+        await loop.run_in_executor(None, partial(gTTS(text=text, lang='en').save, str(out_path)))
         return f"{PUBLIC_URL}/static/tts/{fname}"
     except Exception as e:
-        print("pyttsx3 TTS failed:", e)
+        print("gTTS TTS failed:", e)
         return None
 
 async def handle_play_tts_cmd(call_sid: str, text: str):
