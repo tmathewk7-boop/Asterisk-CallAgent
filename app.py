@@ -10,6 +10,7 @@ from collections import defaultdict
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -53,6 +54,7 @@ app = FastAPI()
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
+app.mount("/static", StaticFiles(directory="static"), name="static")
 
 # ====================== Twilio Incoming Call Handler ======================
 @app.post("/twilio/incoming")
@@ -66,7 +68,7 @@ async def twilio_incoming(request: Request):
 <Response>
   <Say voice="alice">Connecting you to the AI assistant.</Say>
   <Start>
-    <Stream url="wss://{(PUBLIC_URL).replace('https://','').replace('http://','')}/media-ws"/>
+    <Stream url="wss://https://asterisk-callagent.onrender.com/media-ws"/>
   </Start>
   <Pause length="3600"/>
 </Response>"""
@@ -183,11 +185,12 @@ async def process_and_transcribe(call_sid: str, pcm_bytes: bytes):
     if tts_url and twilio_client:
         try:
             twiml_play = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response><Play>{tts_url}</Play></Response>"""
+    <Response><Play>{tts_url}</Play></Response>"""
             twilio_client.calls(call_sid).update(twiml=twiml_play)
             await notify_dashboard({"event":"ai_play_started","callSid":call_sid,"tts_url":tts_url})
         except Exception as e:
             print("Error playing TTS in call:", e)
+
 
     try:
         Path(wav_path).unlink(missing_ok=True)
