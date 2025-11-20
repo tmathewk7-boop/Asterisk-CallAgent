@@ -139,28 +139,37 @@ async def media_ws_endpoint(ws: WebSocket):
             data = json.loads(msg)
             event = data.get("event")
 
+            # --- Call started ---
             if event == "start":
                 call_sid = data.get("start", {}).get("callSid")
                 media_ws_map[call_sid] = ws
+                print(f"Call started: {call_sid}")
 
-                # Stream welcome TTS only once per call
+                # Wait a tiny bit to ensure Twilio is ready
+                await asyncio.sleep(0.5)
+
+                # Stream welcome TTS once
                 if call_sid not in welcome_sent:
                     welcome_sent.add(call_sid)
                     welcome_path = TTS_DIR / "welcome.mp3"
-                    asyncio.create_task(send_tts_to_call(ws, welcome_path))
+                    print(f"Streaming welcome TTS for call {call_sid}")
+                    await send_tts_to_call(ws, welcome_path)
 
+            # --- Incoming audio from caller ---
             elif event == "media":
                 payload_b64 = data["media"]["payload"]
                 pcm_bytes = base64.b64decode(payload_b64)
+                audio_buffers[call_sid] += pcm_bytes  # store for transcription
                 asyncio.create_task(process_and_transcribe(call_sid, pcm_bytes))
-                pass
 
+            # --- Call stopped ---
             elif event == "stop":
+                print(f"Call ended: {call_sid}")
                 if call_sid and audio_buffers[call_sid]:
+                    # Process any remaining audio
                     pcm_chunk = bytes(audio_buffers[call_sid])
                     audio_buffers[call_sid].clear()
                     await process_and_transcribe(call_sid, pcm_chunk)
-                pass
 
     except WebSocketDisconnect:
         print("Media WebSocket disconnected.")
@@ -168,6 +177,7 @@ async def media_ws_endpoint(ws: WebSocket):
         if call_sid and call_sid in media_ws_map:
             del media_ws_map[call_sid]
             print(f"Cleaned up media_ws_map for {call_sid}")
+
 
 
 # ====================== Dashboard WS ======================
@@ -328,18 +338,32 @@ def mp3_to_pcm8khz_bytes(mp3_path):
     audio = audio.set_frame_rate(8000).set_channels(1).set_sample_width(2)
     return audio.raw_data
 
-async def send_tts_to_call(ws: WebSocket, tts_path):
-    pcm = mp3_to_pcm8khz_bytes(tts_path)
-    print(f"Sending TTS {tts_path} to call, total bytes={len(pcm)}")
-    frame_size = 320
+async def send_tts_to_call(ws: WebSocket, tts_path: Path):
+    """
+    Send a TTS MP3 to the Twilio Media Stream in proper 8kHz PCM frames.
+    """
+    try:
+        audio = AudioSegment.from_file(tts_path)
+        audio = audio.set_frame_rate(8000).set_channels(1).set_sample_width(2)
+        pcm = audio.raw_data
+    except Exception as e:
+        print("Failed to load TTS audio:", e)
+        return
+
+    frame_size = 320  # 20ms of 8kHz, 16-bit audio
+    total_frames = len(pcm) // frame_size
+    print(f"Sending TTS {tts_path.name} ({len(pcm)} bytes, {total_frames} frames)")
+
     for i in range(0, len(pcm), frame_size):
-        chunk = pcm[i:i+frame_size]
+        chunk = pcm[i:i + frame_size]
         await ws.send_json({
             "event": "media",
             "media": {"payload": base64.b64encode(chunk).decode()}
         })
-        await asyncio.sleep(0.02)
-    print("TTS streaming finished")
+        await asyncio.sleep(0.02)  # 20ms per frame
+
+    print(f"TTS streaming finished: {tts_path.name}")
+
 
 async def wait_for_media_ws(call_sid, timeout=3):
     start = time.time()
