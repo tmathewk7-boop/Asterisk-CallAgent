@@ -7,6 +7,7 @@ import tempfile
 import time
 import sys
 import audioop
+import pydub
 sys.modules['pyaudioop'] = audioop
 from pathlib import Path
 from collections import defaultdict
