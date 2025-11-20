@@ -5,6 +5,9 @@ import asyncio
 import json
 import tempfile
 import time
+import sys
+import audioop
+sys.modules['pyaudioop'] = audioop
 from pathlib import Path
 from collections import defaultdict
 
