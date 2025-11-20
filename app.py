@@ -1,52 +1,25 @@
 # main.py
-media_ws_map = {}
+"""
+Working Twilio Media Streams example (FastAPI).
+- Accepts incoming Twilio call webhook at /twilio/incoming (returns TwiML that opens a media stream to /media-ws)
+- Handles Twilio media websocket messages at /media-ws
+- Buffers incoming audio (µ-law 8kHz) and processes ~1s chunks
+- Produces a text reply (stubbed) and streams it back to the call as µ-law frames
+Notes:
+- Do NOT call Twilio REST to change TwiML mid-call (that will tear down streaming).
+- Make sure PUBLIC_URL is reachable by Twilio and uses wss/http/https accordingly.
+"""
 import os
 import base64
 import asyncio
 import json
 import tempfile
 import time
-import sys
-import base64
-# Mock audioop for Render (Python 3.13)
-try:
-    import audioop
-except ModuleNotFoundError:
-    import numpy as np
-
-    class audioop:
-        @staticmethod
-        def lin2lin(fragment, width_from, width_to):
-            return np.frombuffer(fragment, dtype=np.int16).tobytes()
-        @staticmethod
-        def max(fragment, width):
-            return max(fragment) if fragment else 0
-
-    import sys
-    sys.modules['audioop'] = audioop
-
-# Patch pyaudioop for pydub
-import sys
-sys.modules['pyaudioop'] = sys.modules['audioop']
-
-# Now safe to import pydub
-from pydub import AudioSegment
-
-
-import pydub
-sys.modules['pyaudioop'] = audioop
+import math
+import struct
 from pathlib import Path
 from collections import defaultdict
-
-STATIC_DIR = Path("./static")
-TTS_DIR = STATIC_DIR / "tts"
-TTS_DIR.mkdir(parents=True, exist_ok=True)
-
-welcome_path = TTS_DIR / "welcome.mp3"
-if not welcome_path.exists():
-    from gtts import gTTS
-    tts = gTTS("Connecting you to the AI assistant.", lang="en")
-    tts.save(str(welcome_path))
+from functools import partial
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, HTMLResponse
@@ -54,295 +27,279 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-import soundfile as sf
-import numpy as np
-
-# Audio processing
-
-import pyttsx3  # local TTS fallback
-
-# Twilio
-from twilio.rest import Client as TwilioClient
-
+from pydub import AudioSegment
 from gtts import gTTS
-from functools import partial
-from asyncio import get_running_loop
 
-# ========== ENVIRONMENT VARIABLES ==========
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+# ---------- Configuration ----------
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")  # optional, not used to change call midstream
 TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-TWILIO_PHONE_NUMBER = os.getenv("TWILIO_PHONE_NUMBER", "+1XXXX")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "https://example.onrender.com")
+PUBLIC_URL = os.getenv("PUBLIC_URL", "https://your-app.onrender.com")  # <-- set this in Render
 PORT = int(os.getenv("PORT", 8000))
-TWILIO_SAMPLE_RATE = int(os.getenv("TWILIO_SAMPLE_RATE", 8000))
+SAMPLE_RATE = 8000  # Twilio stream sample rate
+# -----------------------------------
 
+STATIC_DIR = Path("./static")
+TTS_DIR = STATIC_DIR / "tts"
+TTS_DIR.mkdir(parents=True, exist_ok=True)
 
-
-# ========== GLOBAL STATE ==========
-audio_buffers = defaultdict(bytearray)
-last_activity = {}
-call_history = defaultdict(list)  # short-term local conversation memory
-last_ai_reply_time = defaultdict(lambda: 0.0)
-
-twilio_client = None
-if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
-    twilio_client = TwilioClient(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-
-# dashboard websocket manager
-dashboard_ws: WebSocket | None = None
-dashboard_lock = asyncio.Lock()
+# Prepare a welcome file (will be created if missing)
+welcome_path = TTS_DIR / "welcome.mp3"
+if not welcome_path.exists():
+    gTTS("Connecting you to the AI assistant.", lang="en").save(str(welcome_path))
 
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
-app.mount("/static", StaticFiles(directory="static"), name="static")
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-# ====================== Twilio Incoming Call Handler ======================
+# State
+call_audio_buffer = defaultdict(bytearray)   # incoming µ-law bytes per callSid
+media_ws_map = {}                            # callSid -> websocket
+last_ai_reply_time = defaultdict(lambda: 0.0)
+
+# ---------------- µ-law helper functions ----------------
+# Standard µ-law encoding/decoding (8-bit µ-law <-> signed 16-bit PCM)
+BIAS = 0x84
+CLIP = 32635
+
+def ulaw2lin(u_val):
+    """Convert a single 8-bit mu-law value to 16-bit signed PCM."""
+    u_val = ~u_val & 0xFF
+    sign = (u_val & 0x80)
+    exponent = (u_val >> 4) & 0x07
+    mantissa = u_val & 0x0F
+    t = ((mantissa << 3) + 0x84) << exponent
+    sample = t - 0x84
+    if sign != 0:
+        return -sample
+    else:
+        return sample
+
+def lin2ulaw(sample):
+    """Convert a single 16-bit PCM sample to 8-bit µ-law."""
+    # Clamp
+    if sample > CLIP:
+        sample = CLIP
+    if sample < -CLIP:
+        sample = -CLIP
+
+    sign = 0
+    if sample < 0:
+        sample = -sample
+        sign = 0x80
+    sample = sample + BIAS
+    exponent = 7
+    mask = 0x4000
+    for i in range(7):
+        if sample & mask:
+            exponent = i
+            break
+        mask >>= 1
+    mantissa = (sample >> (exponent + 3)) & 0x0F
+    u_val = ~(sign | (exponent << 4) | mantissa) & 0xFF
+    return u_val
+
+def ulaw_bytes_to_pcm16_bytes(ulaw_bytes: bytes) -> bytes:
+    """Convert bytes of µ-law to bytes of 16-bit LE PCM."""
+    out = bytearray()
+    for b in ulaw_bytes:
+        s = ulaw2lin(b)
+        out += struct.pack("<h", int(s))
+    return bytes(out)
+
+def pcm16_bytes_to_ulaw_bytes(pcm16_bytes: bytes) -> bytes:
+    """Convert 16-bit LE PCM bytes to µ-law bytes."""
+    samples = struct.unpack("<{}h".format(len(pcm16_bytes)//2), pcm16_bytes)
+    return bytes([lin2ulaw(int(s)) for s in samples])
+
+# ---------------- End µ-law helpers ----------------
+
+# ---------------- TwiML endpoint ----------------
 @app.post("/twilio/incoming")
 async def twilio_incoming(request: Request):
     form = await request.form()
-    from_number = form.get("From")
     call_sid = form.get("CallSid")
-    print("Incoming call from", from_number, "CallSid", call_sid)
+    from_number = form.get("From")
+    print(f"Incoming call from {from_number} CallSid {call_sid}")
 
-    # TwiML: only start media stream, no <Play>
+    # Use <Start><Stream> TwiML to open a media websocket to our /media-ws endpoint.
+    # Twilio expects a WSS URL when it connects; Twilio will connect using its own transport.
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Play>{PUBLIC_URL}/static/tts/welcome.mp3</Play>
   <Start>
     <Stream url="{PUBLIC_URL}/media-ws"/>
   </Start>
   <Pause length="3600"/>
 </Response>"""
-
-    await notify_dashboard({
-        "event": "call_started",
-        "from": from_number,
-        "callSid": call_sid,
-        "timestamp": int(time.time())
-    })
-
     return PlainTextResponse(content=twiml, media_type="text/xml")
 
-
-# ====================== Twilio Media Streams WS ======================
+# ---------------- Media WebSocket ----------------
 @app.websocket("/media-ws")
 async def media_ws_endpoint(ws: WebSocket):
     await ws.accept()
     call_sid = None
+    stream_sid = None
+    print("Media WS connected")
 
     try:
         while True:
-            msg = await ws.receive_text()
-            data = json.loads(msg)
+            raw = await ws.receive_text()
+            data = json.loads(raw)
             event = data.get("event")
 
             if event == "start":
-                call_sid = data["start"]["callSid"]
+                call_sid = data["start"].get("callSid")
+                stream_sid = data["start"].get("streamSid", None)
                 media_ws_map[call_sid] = ws
-                # Stream welcome TTS over the media WebSocket
-                await send_tts_to_call(ws, TTS_DIR / "welcome.mp3")
+                print(f"[{call_sid}] stream START (streamSid={stream_sid})")
+                # Immediately stream the welcome message back (as µ-law)
+                await send_text_tts_over_ws(ws, stream_sid, "Connecting you to the AI assistant. Say something and I'll reply.")
+                continue
 
+            if event == "media":
+                # Twilio sends base64 encoded payload of µ-law bytes (one byte per sample at 8kHz)
+                payload_b64 = data["media"]["payload"]
+                chunk = base64.b64decode(payload_b64)
+                if call_sid is None:
+                    # if no call_sid (rare), try to find inside start object or ignore
+                    print("Received media before start? ignoring")
+                    continue
 
-            elif event == "media":
-                payload = base64.b64decode(data["media"]["payload"])
-                await process_and_transcribe(call_sid, payload)
+                # Append to buffer for that call
+                call_audio_buffer[call_sid].extend(chunk)
 
-            elif event == "stop":
-                print(f"Call stopped: {call_sid}")
+                # If we've accumulated ~1 second (8000 samples => 8000 bytes) then process
+                if len(call_audio_buffer[call_sid]) >= 8000:
+                    audio_ulaw = bytes(call_audio_buffer[call_sid])
+                    call_audio_buffer[call_sid].clear()
+                    # spawn background processing (won't block websocket)
+                    asyncio.create_task(handle_audio_chunk(call_sid, stream_sid, audio_ulaw))
+                continue
+
+            if event == "stop":
+                print(f"[{call_sid}] stream STOP")
                 break
 
-    finally:
-        if call_sid in media_ws_map:
-            del media_ws_map[call_sid]
-
-
-# ====================== Dashboard WS ======================
-@app.websocket("/dashboard-ws")
-async def dashboard_ws_endpoint(ws: WebSocket):
-    global dashboard_ws
-    await ws.accept()
-    print("Dashboard connected.")
-    async with dashboard_lock:
-        dashboard_ws = ws
-    try:
-        while True:
-            msg = await ws.receive_text()
-            print("Dashboard -> backend:", msg)
-            try:
-                obj = json.loads(msg)
-                if obj.get("cmd") == "play_tts":
-                    asyncio.create_task(handle_play_tts_cmd(obj.get("callSid"), obj.get("text")))
-            except Exception:
-                pass
     except WebSocketDisconnect:
-        print("Dashboard disconnected.")
+        print("Media WS disconnected")
+    except Exception as e:
+        print("Media WS error:", e)
     finally:
-        async with dashboard_lock:
-            if dashboard_ws == ws:
-                dashboard_ws = None
+        if call_sid and call_sid in media_ws_map:
+            del media_ws_map[call_sid]
+        if call_sid and call_sid in call_audio_buffer:
+            del call_audio_buffer[call_sid]
+        print(f"[{call_sid}] cleaned up")
 
-async def notify_dashboard(payload: dict):
-    global dashboard_ws
-    if dashboard_ws is None:
-        return
-    try:
-        await dashboard_ws.send_text(json.dumps(payload))
-    except Exception as e:
-        print("Error sending to dashboard:", e)
+# ---------------- Audio processing pipeline ----------------
+async def handle_audio_chunk(call_sid: str, stream_sid: str, audio_ulaw: bytes):
+    """
+    audio_ulaw: raw µ-law bytes (8kHz mono). Convert to PCM for STT or debugging.
+    This is a stubbed pipeline that pretends it recognized speech and replies.
+    Replace the STT stub with a real STT call (Deepgram, OpenAI, etc.).
+    """
+    print(f"[{call_sid}] handling audio chunk, {len(audio_ulaw)} bytes")
 
-# ====================== Transcription & AI ======================
-async def process_and_transcribe(call_sid: str, pcm_bytes: bytes):
-    # 1️⃣ Assemble the incoming audio chunk (existing code)
-    channels = 1
-    sampwidth = 2
+    # Convert µ-law to 16-bit PCM
+    pcm16 = ulaw_bytes_to_pcm16_bytes(audio_ulaw)
+
+    # Optional: write to temp WAV for debugging
     try:
-        audio = AudioSegment(
-            data=pcm_bytes,
-            sample_width=sampwidth,
-            frame_rate=TWILIO_SAMPLE_RATE,
-            channels=channels
-        )
         with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-            wav_path = tf.name
-            audio.export(wav_path, format="wav")
+            tmp_wav = tf.name
+        # Use pydub to build a wav (frame_rate=8000, sample_width=2)
+        seg = AudioSegment(
+            data=pcm16,
+            sample_width=2,
+            frame_rate=SAMPLE_RATE,
+            channels=1
+        )
+        seg.export(tmp_wav, format="wav")
+        # (You can inspect tmp_wav if needed)
     except Exception as e:
-        print("Audio chunk assembly failed:", e)
-        return
+        print(f"[{call_sid}] failed writing debug wav: {e}")
 
-    # 2️⃣ Notify dashboard (simulate transcription)
-    transcript = "User spoke."
-    await notify_dashboard({
-        "event": "transcript",
-        "callSid": call_sid,
-        "text": transcript,
-        "timestamp": int(time.time())
-    })
+    # --- STT stub ----
+    # In production: send `pcm16` to your ASR provider and get user_text.
+    user_text = "hello"  # placeholder
+    print(f"[{call_sid}] (stub) recognized: {user_text}")
 
-    # 3️⃣ Generate AI reply
-    ai_reply = await generate_ai_response(call_sid, transcript)
-
-    # 4️⃣ Generate TTS locally (MP3)
-    tts_path = TTS_DIR / f"{call_sid}_ai.mp3"
-    from gtts import gTTS
-    gTTS(ai_reply).save(tts_path)
-
-    # 5️⃣ Stream TTS over the call's media WebSocket (real-time)
-    ws = await wait_for_media_ws(call_sid)
-    if ws:
-        await send_tts_to_call(ws, tts_path)
-    else:
-        print("Media WebSocket not ready for TTS streaming")
-
-
-    # 6️⃣ Optional: update Twilio TTS fallback (less reliable)
-    if tts_path.exists() and twilio_client:
-        try:
-            twiml_play = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response><Play>{PUBLIC_URL}/static/tts/{tts_path.name}</Play></Response>"""
-            twilio_client.calls(call_sid).update(twiml=twiml_play)
-            await notify_dashboard({
-                "event":"ai_play_started",
-                "callSid":call_sid,
-                "tts_url":f"{PUBLIC_URL}/static/tts/{tts_path.name}"
-            })
-        except Exception as e:
-            print("Error playing TTS in call via Twilio:", e)
-
-    # 7️⃣ Cleanup
-    try:
-        Path(wav_path).unlink(missing_ok=True)
-    except Exception:
-        pass
-
-
-# ====================== Local Rule-Based AI ======================
-async def generate_ai_response(call_sid: str, user_text: str) -> str:
+    # Simple AI reply logic — avoid spamming replies too quickly
     now = time.time()
-    if now - last_ai_reply_time[call_sid] < 2:  # avoid spam
-        return "..."
+    if now - last_ai_reply_time[call_sid] < 1.5:
+        print(f"[{call_sid}] skipping reply to avoid overlap")
+        return
     last_ai_reply_time[call_sid] = now
 
-    # Simple rules for testing
-    text = user_text.lower()
-    if "hello" in text:
-        return "Hello! This is a test AI."
-    elif "help" in text:
-        return "I am here to assist you."
+    ai_reply = f"I heard you: \"{user_text}\". This is a test reply."
+
+    # send TTS back
+    ws = media_ws_map.get(call_sid)
+    if ws:
+        await send_text_tts_over_ws(ws, stream_sid, ai_reply)
     else:
-        return "Thanks for speaking. This is a demo reply."
+        print(f"[{call_sid}] websocket disappeared before reply")
 
-# ====================== TTS via pyttsx3 ======================
-def safe_filename(call_sid: str, text: str) -> str:
-    import hashlib
-    h = hashlib.sha256(text.encode()).hexdigest()[:12]
-    ts = int(time.time())
-    return f"{call_sid}_{ts}_{h}.wav"
-
-async def synthesize_tts_and_get_url(call_sid: str, text: str) -> str | None:
-    fname = safe_filename(call_sid, text).replace(".wav", ".mp3")
-    out_path = TTS_DIR / fname
-
-    loop = get_running_loop()
+# ---------------- TTS and streaming back as µ-law ----------------
+async def send_text_tts_over_ws(ws: WebSocket, stream_sid: str, text: str):
+    """
+    Generate TTS (gTTS -> mp3), convert to PCM 16-bit @8kHz mono,
+    convert to µ-law bytes, and stream them to Twilio over the media websocket.
+    """
+    print("Generating TTS:", text)
+    # create temp mp3
+    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
+        mp3_path = tf.name
     try:
-        await loop.run_in_executor(None, partial(gTTS(text=text, lang='en').save, str(out_path)))
-        return f"{PUBLIC_URL}/static/tts/{fname}"
-    except Exception as e:
-        print("gTTS TTS failed:", e)
-        return None
+        gTTS(text=text, lang="en").save(mp3_path)
 
-async def handle_play_tts_cmd(call_sid: str, text: str):
-    tts_url = await synthesize_tts_and_get_url(call_sid, text)
-    if not tts_url:
-        await notify_dashboard({"event":"ai_play_failed","callSid":call_sid})
-        return
-    twiml_play = f"""<?xml version="1.0" encoding="UTF-8"?>
-<Response><Play>{tts_url}</Play></Response>"""
-    try:
-        twilio_client.calls(call_sid).update(twiml=twiml_play)
-        await notify_dashboard({"event":"ai_play_started","callSid":call_sid,"tts_url":tts_url})
-    except Exception as e:
-        print("play_tts error", e)
-        await notify_dashboard({"event":"ai_play_failed","callSid":call_sid,"error":str(e)})
+        # load via pydub and convert to PCM16 @8kHz mono
+        audio = AudioSegment.from_file(mp3_path)
+        audio = audio.set_frame_rate(SAMPLE_RATE).set_channels(1).set_sample_width(2)
+        pcm16 = audio.raw_data  # little-endian 16-bit PCM
 
-# ====================== Health Route ======================
+        # convert to µ-law bytes
+        ulaw_bytes = pcm16_bytes_to_ulaw_bytes(pcm16)
+
+        # send in small chunks (keep under ~1 KB; Twilio handles small packets)
+        chunk_size = 160  # 20 ms at 8kHz -> 160 samples -> 160 bytes of µ-law
+        for i in range(0, len(ulaw_bytes), chunk_size):
+            chunk = ulaw_bytes[i:i + chunk_size]
+            payload = base64.b64encode(chunk).decode("ascii")
+            msg = {
+                "event": "media",
+                "streamSid": stream_sid,
+                "media": {"payload": payload}
+            }
+            await ws.send_json(msg)
+            await asyncio.sleep(0.02)  # pace the stream
+
+        # optional mark event
+        try:
+            await ws.send_json({
+                "event": "mark",
+                "streamSid": stream_sid,
+                "mark": {"name": "tts_done"}
+            })
+        except Exception:
+            pass
+
+        print("TTS streaming finished")
+    except Exception as e:
+        print("TTS generation/streaming error:", e)
+    finally:
+        try:
+            os.unlink(mp3_path)
+        except Exception:
+            pass
+
+# ---------------- Health ----------------
 @app.get("/")
 async def index():
-    return HTMLResponse("<h3>Voice Engine running. Connect your dashboard to /dashboard-ws</h3>")
+    return HTMLResponse("<h3>Voice Engine Online</h3>")
 
-def mp3_to_pcm8khz_bytes(mp3_path):
-    audio = AudioSegment.from_file(mp3_path)
-    audio = audio.set_frame_rate(8000).set_channels(1).set_sample_width(2)
-    return audio.raw_data
-
-async def send_tts_to_call(ws: WebSocket, tts_path: Path):
-    audio = AudioSegment.from_file(tts_path)
-    audio = audio.set_frame_rate(8000).set_channels(1).set_sample_width(2)
-    pcm = audio.raw_data
-    frame_size = 320  # 20ms at 8kHz 16-bit
-
-    for i in range(0, len(pcm), frame_size):
-        chunk = pcm[i:i+frame_size]
-        await ws.send_json({
-            "event": "media",
-            "media": {"payload": base64.b64encode(chunk).decode()}
-        })
-        await asyncio.sleep(0.02)
-
-
-
-async def wait_for_media_ws(call_sid, timeout=3):
-    start = time.time()
-    while time.time() - start < timeout:
-        ws = media_ws_map.get(call_sid)
-        if ws:
-            return ws
-        await asyncio.sleep(0.1)
-    return None
-
-# ====================== Run Server ======================
+# ---------------- Run ----------------
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
-
 
