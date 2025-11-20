@@ -38,6 +38,10 @@ sys.modules['pyaudioop'] = audioop
 from pathlib import Path
 from collections import defaultdict
 
+STATIC_DIR = Path("./static")
+TTS_DIR = STATIC_DIR / "tts"
+TTS_DIR.mkdir(parents=True, exist_ok=True)
+
 welcome_path = TTS_DIR / "welcome.mp3"
 if not welcome_path.exists():
     from gtts import gTTS
@@ -72,9 +76,7 @@ PUBLIC_URL = os.getenv("PUBLIC_URL", "https://example.onrender.com")
 PORT = int(os.getenv("PORT", 8000))
 TWILIO_SAMPLE_RATE = int(os.getenv("TWILIO_SAMPLE_RATE", 8000))
 
-STATIC_DIR = Path("./static")
-TTS_DIR = STATIC_DIR / "tts"
-TTS_DIR.mkdir(parents=True, exist_ok=True)
+
 
 # ========== GLOBAL STATE ==========
 audio_buffers = defaultdict(bytearray)
