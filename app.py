@@ -6,7 +6,32 @@ import json
 import tempfile
 import time
 import sys
-import audioop
+
+# Mock audioop for Render (Python 3.13)
+try:
+    import audioop
+except ModuleNotFoundError:
+    import numpy as np
+
+    class audioop:
+        @staticmethod
+        def lin2lin(fragment, width_from, width_to):
+            return np.frombuffer(fragment, dtype=np.int16).tobytes()
+        @staticmethod
+        def max(fragment, width):
+            return max(fragment) if fragment else 0
+
+    import sys
+    sys.modules['audioop'] = audioop
+
+# Patch pyaudioop for pydub
+import sys
+sys.modules['pyaudioop'] = sys.modules['audioop']
+
+# Now safe to import pydub
+from pydub import AudioSegment
+
+
 import pydub
 sys.modules['pyaudioop'] = audioop
 from pathlib import Path
@@ -27,7 +52,6 @@ import pyttsx3  # local TTS fallback
 
 # Twilio
 from twilio.rest import Client as TwilioClient
-from pydub import AudioSegment
 
 # ========== ENVIRONMENT VARIABLES ==========
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
