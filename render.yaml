@@ -1,6 +1,7 @@
 services:
-  - type: web
+  - type: docker
     name: ai-caller
-    env: docker
-    branch: main
-
+    dockerfilePath: ./Dockerfile
+    envVars:
+      - key: PORT
+        value: 10000
