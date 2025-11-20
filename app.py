@@ -62,7 +62,7 @@ async def twilio_incoming(request: Request):
     call_sid = form.get("CallSid")
     print("Incoming call from", from_number, "CallSid", call_sid)
 
-    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
+    twiml = """<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Say voice="alice">Connecting you to the AI assistant.</Say>
   <Start>
