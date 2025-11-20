@@ -8,4 +8,4 @@ pyttsx3>=2.90
 numpy>=1.26.0
 soundfile>=0.12.1
 python-multipart==0.0.6
-
+pydub
