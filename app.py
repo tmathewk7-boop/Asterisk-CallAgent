@@ -131,35 +131,44 @@ async def media_ws_endpoint(ws: WebSocket):
     await ws.accept()
     print("Media WebSocket connected")
     call_sid = None
+    welcome_sent = set()  # Track which call SIDs have received the welcome
+
     try:
         while True:
             msg = await ws.receive_text()
             data = json.loads(msg)
             event = data.get("event")
+
             if event == "start":
                 call_sid = data.get("start", {}).get("callSid")
                 media_ws_map[call_sid] = ws
+
+                # Stream welcome TTS only once per call
+                if call_sid not in welcome_sent:
+                    welcome_sent.add(call_sid)
+                    welcome_path = TTS_DIR / "welcome.mp3"
+                    asyncio.create_task(send_tts_to_call(ws, welcome_path))
+
             elif event == "media":
                 payload_b64 = data["media"]["payload"]
-                pcm = base64.b64decode(payload_b64)
-                audio_buffers[call_sid] += pcm
-                last_activity[call_sid] = time.time()
-
-                if len(audio_buffers[call_sid]) > (TWILIO_SAMPLE_RATE * 2 * 5):  # ~5s audio
-                    pcm_chunk = bytes(audio_buffers[call_sid])
-                    audio_buffers[call_sid].clear()
-                    asyncio.create_task(process_and_transcribe(call_sid, pcm_chunk))
+                pcm_bytes = base64.b64decode(payload_b64)
+                asyncio.create_task(process_and_transcribe(call_sid, pcm_bytes))
+                pass
 
             elif event == "stop":
-                if call_sid and len(audio_buffers[call_sid]) > 0:
+                if call_sid and audio_buffers[call_sid]:
                     pcm_chunk = bytes(audio_buffers[call_sid])
                     audio_buffers[call_sid].clear()
                     await process_and_transcribe(call_sid, pcm_chunk)
-                await notify_dashboard({"event": "call_ended", "callSid": call_sid, "timestamp": int(time.time())})
-            else:
                 pass
+
     except WebSocketDisconnect:
         print("Media WebSocket disconnected.")
+    finally:
+        if call_sid and call_sid in media_ws_map:
+            del media_ws_map[call_sid]
+            print(f"Cleaned up media_ws_map for {call_sid}")
+
 
 # ====================== Dashboard WS ======================
 @app.websocket("/dashboard-ws")
@@ -232,12 +241,12 @@ async def process_and_transcribe(call_sid: str, pcm_bytes: bytes):
     gTTS(ai_reply).save(tts_path)
 
     # 5️⃣ Stream TTS over the call's media WebSocket (real-time)
-    ws = media_ws_map.get(call_sid)
+    ws = await wait_for_media_ws(call_sid)
     if ws:
-        try:
-            await send_tts_to_call(ws, tts_path)
-        except Exception as e:
-            print("Failed to send TTS to call WS:", e)
+        await send_tts_to_call(ws, tts_path)
+    else:
+        print("Media WebSocket not ready for TTS streaming")
+
 
     # 6️⃣ Optional: update Twilio TTS fallback (less reliable)
     if tts_path.exists() and twilio_client:
@@ -332,6 +341,14 @@ async def send_tts_to_call(ws: WebSocket, tts_path):
         await asyncio.sleep(0.02)
     print("TTS streaming finished")
 
+async def wait_for_media_ws(call_sid, timeout=3):
+    start = time.time()
+    while time.time() - start < timeout:
+        ws = media_ws_map.get(call_sid)
+        if ws:
+            return ws
+        await asyncio.sleep(0.1)
+    return None
 
 # ====================== Run Server ======================
 if __name__ == "__main__":
