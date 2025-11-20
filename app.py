@@ -121,7 +121,7 @@ async def twilio_incoming(request: Request):
         "timestamp": int(time.time())
     })
 
-    return PlainTextResponse(content=twiml, media_type="text/xml")"""
+    return PlainTextResponse(content=twiml, media_type="text/xml")
 
 # ====================== Twilio Media Streams WS ======================
 @app.websocket("/media-ws")
