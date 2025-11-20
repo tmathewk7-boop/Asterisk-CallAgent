@@ -21,4 +21,5 @@ EXPOSE 8000
 
 # 6. Command to run the app
 # We use the shell form to ensure $PORT variable is expanded correctly
-CMD uvicorn app:app --host 0.0.0.0 --port $PORT
+CMD ["uvicorn", "app:app", "--host", "0.0.0.0", "--port", "8000"]
+
