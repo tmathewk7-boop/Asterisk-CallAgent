@@ -10,3 +10,4 @@ soundfile>=0.12.1
 python-multipart==0.0.6
 pydub
 gtts==2.3.2
+deepgram-sdk
