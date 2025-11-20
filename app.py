@@ -23,6 +23,7 @@ import pyttsx3  # local TTS fallback
 
 # Twilio
 from twilio.rest import Client as TwilioClient
+from pydub import AudioSegment
 
 # ========== ENVIRONMENT VARIABLES ==========
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
