@@ -1,4 +1,5 @@
 # main.py
+media_ws_map = {}
 import os
 import base64
 import asyncio
@@ -6,7 +7,7 @@ import json
 import tempfile
 import time
 import sys
-
+import base64
 # Mock audioop for Render (Python 3.13)
 try:
     import audioop
@@ -36,6 +37,12 @@ import pydub
 sys.modules['pyaudioop'] = audioop
 from pathlib import Path
 from collections import defaultdict
+
+welcome_path = TTS_DIR / "welcome.mp3"
+if not welcome_path.exists():
+    from gtts import gTTS
+    tts = gTTS("Connecting you to the AI assistant.", lang="en")
+    tts.save(str(welcome_path))
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, HTMLResponse
@@ -97,11 +104,12 @@ async def twilio_incoming(request: Request):
     call_sid = form.get("CallSid")
     print("Incoming call from", from_number, "CallSid", call_sid)
 
-    twiml = """<?xml version="1.0" encoding="UTF-8"?>
+    # Play the pre-generated welcome TTS
+    twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="alice">Connecting you to the AI assistant.</Say>
+  <Play>{PUBLIC_URL}/static/tts/welcome.mp3</Play>
   <Start>
-    <Stream url="wss://asterisk-callagent.onrender.com/media-ws"/>
+    <Stream url="{PUBLIC_URL}/media-ws"/>
   </Start>
   <Pause length="3600"/>
 </Response>"""
@@ -113,7 +121,7 @@ async def twilio_incoming(request: Request):
         "timestamp": int(time.time())
     })
 
-    return PlainTextResponse(content=twiml, media_type="text/xml")
+    return PlainTextResponse(content=twiml, media_type="text/xml")"""
 
 # ====================== Twilio Media Streams WS ======================
 @app.websocket("/media-ws")
@@ -128,8 +136,7 @@ async def media_ws_endpoint(ws: WebSocket):
             event = data.get("event")
             if event == "start":
                 call_sid = data.get("start", {}).get("callSid")
-                print("Stream started callSid", call_sid)
-                last_activity[call_sid] = time.time()
+                media_ws_map[call_sid] = ws
             elif event == "media":
                 payload_b64 = data["media"]["payload"]
                 pcm = base64.b64decode(payload_b64)
@@ -188,6 +195,7 @@ async def notify_dashboard(payload: dict):
 
 # ====================== Transcription & AI ======================
 async def process_and_transcribe(call_sid: str, pcm_bytes: bytes):
+    # 1️⃣ Assemble the incoming audio chunk (existing code)
     channels = 1
     sampwidth = 2
     try:
@@ -204,7 +212,7 @@ async def process_and_transcribe(call_sid: str, pcm_bytes: bytes):
         print("Audio chunk assembly failed:", e)
         return
 
-    # For testing, simulate transcription as "user said something"
+    # 2️⃣ Notify dashboard (simulate transcription)
     transcript = "User spoke."
     await notify_dashboard({
         "event": "transcript",
@@ -213,22 +221,42 @@ async def process_and_transcribe(call_sid: str, pcm_bytes: bytes):
         "timestamp": int(time.time())
     })
 
+    # 3️⃣ Generate AI reply
     ai_reply = await generate_ai_response(call_sid, transcript)
-    tts_url = await synthesize_tts_and_get_url(call_sid, ai_reply)
-    if tts_url and twilio_client:
+
+    # 4️⃣ Generate TTS locally (MP3)
+    tts_path = TTS_DIR / f"{call_sid}_ai.mp3"
+    from gtts import gTTS
+    gTTS(ai_reply).save(tts_path)
+
+    # 5️⃣ Stream TTS over the call's media WebSocket (real-time)
+    ws = media_ws_map.get(call_sid)
+    if ws:
+        try:
+            await send_tts_to_call(ws, tts_path)
+        except Exception as e:
+            print("Failed to send TTS to call WS:", e)
+
+    # 6️⃣ Optional: update Twilio TTS fallback (less reliable)
+    if tts_path.exists() and twilio_client:
         try:
             twiml_play = f"""<?xml version="1.0" encoding="UTF-8"?>
-    <Response><Play>{tts_url}</Play></Response>"""
+<Response><Play>{PUBLIC_URL}/static/tts/{tts_path.name}</Play></Response>"""
             twilio_client.calls(call_sid).update(twiml=twiml_play)
-            await notify_dashboard({"event":"ai_play_started","callSid":call_sid,"tts_url":tts_url})
+            await notify_dashboard({
+                "event":"ai_play_started",
+                "callSid":call_sid,
+                "tts_url":f"{PUBLIC_URL}/static/tts/{tts_path.name}"
+            })
         except Exception as e:
-            print("Error playing TTS in call:", e)
+            print("Error playing TTS in call via Twilio:", e)
 
-
+    # 7️⃣ Cleanup
     try:
         Path(wav_path).unlink(missing_ok=True)
     except Exception:
         pass
+
 
 # ====================== Local Rule-Based AI ======================
 async def generate_ai_response(call_sid: str, user_text: str) -> str:
@@ -283,6 +311,25 @@ async def handle_play_tts_cmd(call_sid: str, text: str):
 @app.get("/")
 async def index():
     return HTMLResponse("<h3>Voice Engine running. Connect your dashboard to /dashboard-ws</h3>")
+
+def mp3_to_pcm8khz_bytes(mp3_path):
+    audio = AudioSegment.from_file(mp3_path)
+    audio = audio.set_frame_rate(8000).set_channels(1).set_sample_width(2)
+    return audio.raw_data
+
+async def send_tts_to_call(ws: WebSocket, tts_path):
+    pcm = mp3_to_pcm8khz_bytes(tts_path)
+    print(f"Sending TTS {tts_path} to call, total bytes={len(pcm)}")
+    frame_size = 320
+    for i in range(0, len(pcm), frame_size):
+        chunk = pcm[i:i+frame_size]
+        await ws.send_json({
+            "event": "media",
+            "media": {"payload": base64.b64encode(chunk).decode()}
+        })
+        await asyncio.sleep(0.02)
+    print("TTS streaming finished")
+
 
 # ====================== Run Server ======================
 if __name__ == "__main__":
