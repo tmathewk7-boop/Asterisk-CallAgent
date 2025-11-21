@@ -1,10 +1,13 @@
 # Use a lightweight Python image
 FROM python:3.11-slim
 
-# 1. Install system dependencies (FFmpeg is crucial here)
+# 1. Install system dependencies
 RUN apt-get update && \
     apt-get install -y ffmpeg build-essential && \
     rm -rf /var/lib/apt/lists/*
+
+# --- NEW LINE: Force logs to show up immediately ---
+ENV PYTHONUNBUFFERED=1
 
 # 2. Set up the app directory
 WORKDIR /app
@@ -16,11 +19,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 # 4. Copy the rest of the application code
 COPY . .
 
-# 5. Expose the port (Render sets PORT env var, but good to document)
+# 5. Expose the port
 EXPOSE 8000
 
-# 6. Command to run the app
-# We use the shell form to ensure $PORT variable is expanded correctly
-CMD sh -c "uvicorn app:app --host 0.0.0.0 --port $PORT"
-
+# 6. Run the app (Make sure 'app:app' matches your filename 'app.py')
+CMD sh -c "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"
 
