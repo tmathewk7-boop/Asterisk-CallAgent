@@ -117,12 +117,15 @@ async def media_ws_endpoint(ws: WebSocket):
 
 # ---------------- VAD & Listener ----------------
 async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes):
-    """Decodes audio, checks for silence, and triggers processing."""
+    """
+    Decodes audio, checks for silence, and triggers processing.
+    FIXED: Now waits for REAL silence (1 second) instead of 0.04 seconds.
+    """
     pcm16 = audioop.ulaw2lin(audio_ulaw, 2)
     rms = audioop.rms(pcm16, 2)
     
-    # THRESHOLD: Lower = more sensitive. Higher = ignores noise.
-    SILENCE_THRESHOLD = 2500 
+    # THRESHOLD: 2000 ignores breathing/static, but hears voice.
+    SILENCE_THRESHOLD = 2000 
 
     if rms > SILENCE_THRESHOLD:
         silence_counter[call_sid] = 0
@@ -130,14 +133,27 @@ async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes
     else:
         silence_counter[call_sid] += 1
 
-    # If we have audio and ~0.5s (2 chunks) of silence, process it
-    if silence_counter[call_sid] >= 2 and len(full_sentence_buffer[call_sid]) > 0:
-        complete_audio = bytes(full_sentence_buffer[call_sid])
-        full_sentence_buffer[call_sid].clear()
-        silence_counter[call_sid] = 0
-        
-        # Run in background to avoid blocking websocket
-        asyncio.create_task(handle_complete_sentence(call_sid, stream_sid, complete_audio))
+    # --- THE FIX IS HERE ---
+    # Twilio sends packets every 20ms. 
+    # 50 packets = 1 second.
+    # We wait for 40 packets (0.8s) of silence before assuming you are done.
+    PAUSE_THRESHOLD = 40 
+    
+    if silence_counter[call_sid] >= PAUSE_THRESHOLD:
+        # Check if we actually have enough audio to process (ignore brief clicks)
+        # 4000 bytes is about 0.25 seconds of audio.
+        if len(full_sentence_buffer[call_sid]) > 4000:
+            complete_audio = bytes(full_sentence_buffer[call_sid])
+            full_sentence_buffer[call_sid].clear()
+            silence_counter[call_sid] = 0
+            
+            # Run in background
+            asyncio.create_task(handle_complete_sentence(call_sid, stream_sid, complete_audio))
+        else:
+            # It was just noise/clicks, clear it out to save memory
+            if len(full_sentence_buffer[call_sid]) > 0:
+                full_sentence_buffer[call_sid].clear()
+            silence_counter[call_sid] = 0
 
 async def handle_complete_sentence(call_sid: str, stream_sid: str, pcm_bytes: bytes):
     print(f"[{call_sid}] Processing speech...")
