@@ -31,6 +31,15 @@ import uvicorn
 
 from pydub import AudioSegment
 from gtts import gTTS
+import speech_recognition as sr
+import datetime
+# Initialize the free recognizer
+recognizer = sr.Recognizer()
+
+# Tracks the audio for the current sentence
+full_sentence_buffer = defaultdict(bytearray) 
+# Tracks silence duration
+silence_counter = defaultdict(int)
 
 # ---------- Configuration ----------
 TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")  # optional, not used to change call midstream
@@ -205,48 +214,94 @@ async def media_ws_endpoint(ws: WebSocket):
 # ---------------- Audio processing pipeline ----------------
 async def handle_audio_chunk(call_sid: str, stream_sid: str, audio_ulaw: bytes):
     """
-    Processes audio.
-    FIX: Now checks volume (RMS) to ensure we don't reply to silence.
+    Free Mode Processing:
+    1. VAD: Waits for you to stop speaking.
+    2. STT: Uses Google Free API to transcribe.
+    3. Brain: Uses keywords to reply.
     """
-    # 1. Convert µ-law to PCM so we can calculate volume
+    # 1. Analyze Volume for VAD
     pcm16 = audioop.ulaw2lin(audio_ulaw, 2)
-
-    # --- FIX: SILENCE DETECTION ---
-    # Calculate the Root Mean Square (volume) of the audio chunk.
-    # 16-bit audio ranges from 0 to 32768. 
-    # Silence is usually < 500. Speech is usually > 2000.
     rms = audioop.rms(pcm16, 2)
     
-    print(f"[{call_sid}] Volume (RMS): {rms}")
+    # Tuning: < 1000 is usually silence. > 1000 is speech.
+    SILENCE_THRESHOLD = 1000 
 
-    # Ideally set this between 1000 and 2000. 
-    # If it ignores your voice, LOWER it. If it replies to silence, RAISE it.
-    SILENCE_THRESHOLD = 1500 
-
-    if rms < SILENCE_THRESHOLD:
-        # It's too quiet, probably just line noise. Ignore it.
+    if rms > SILENCE_THRESHOLD:
+        # You are speaking
+        silence_counter[call_sid] = 0
+        full_sentence_buffer[call_sid].extend(pcm16)
+        print(f"[{call_sid}] Speaking... Vol: {rms}")
         return
-
-    # --- STT stub (Placeholder) ----
-    # NOTE: This still pretends you said "hello". 
-    # To fix this for real, you need to send `pcm16` to Deepgram or OpenAI Whisper.
-    user_text = "hello" 
-
-    # Simple AI reply logic — avoid spamming replies too quickly
-    now = time.time()
-    if now - last_ai_reply_time[call_sid] < 2.0:
-        print(f"[{call_sid}] skipping reply to avoid overlap")
-        return
-    last_ai_reply_time[call_sid] = now
-
-    ai_reply = f"I heard you. The volume was {rms}."
-
-    # send TTS back
-    ws = media_ws_map.get(call_sid)
-    if ws:
-        await send_text_tts_over_ws(ws, stream_sid, ai_reply)
     else:
-        print(f"[{call_sid}] websocket disappeared before reply")
+        # You are silent
+        silence_counter[call_sid] += 1
+
+    # 2. Process if we have audio AND ~1 second (3 chunks) of silence
+    if silence_counter[call_sid] >= 3 and len(full_sentence_buffer[call_sid]) > 0:
+        print(f"[{call_sid}] Silence detected. Processing sentence...")
+        
+        # Prepare the audio for Google
+        complete_audio = bytes(full_sentence_buffer[call_sid])
+        full_sentence_buffer[call_sid].clear()
+        silence_counter[call_sid] = 0
+
+        # Save to temp WAV
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+            wav_path = tf.name
+            
+        # Export PCM to WAV (Google needs WAV)
+        AudioSegment(
+            data=complete_audio, 
+            sample_width=2, 
+            frame_rate=SAMPLE_RATE, 
+            channels=1
+        ).export(wav_path, format="wav")
+
+        try:
+            # 3. RUN TRANSCRIPTION (Free Google API)
+            print(f"[{call_sid}] Sending to Google STT...")
+            loop = asyncio.get_running_loop()
+            
+            # Run in background thread (network request)
+            def recognize_speech():
+                with sr.AudioFile(wav_path) as source:
+                    audio_data = recognizer.record(source)
+                    # recognize_google uses a free default key
+                    return recognizer.recognize_google(audio_data)
+
+            transcript = await loop.run_in_executor(None, recognize_speech)
+            print(f"[{call_sid}] You said: '{transcript}'")
+
+            # 4. THE BRAIN (Simple Logic)
+            text = transcript.lower()
+            response_text = "I heard you, but I am not sure what to say."
+
+            if "hello" in text or "hi" in text:
+                response_text = "Hello there! I am a free AI bot."
+            elif "how are you" in text:
+                response_text = "I am doing well, running on simple python logic."
+            elif "time" in text:
+                now = datetime.datetime.now().strftime("%I:%M %p")
+                response_text = f"The current time is {now}."
+            elif "weather" in text:
+                response_text = "I cannot check the weather yet, but I hope it is sunny."
+            else:
+                # Echo back what they said
+                response_text = f"You said: {transcript}"
+
+            # 5. SPEAK BACK
+            ws = media_ws_map.get(call_sid)
+            if ws:
+                await send_text_tts_over_ws(ws, stream_sid, response_text)
+
+        except sr.UnknownValueError:
+            print("Google could not understand audio")
+        except sr.RequestError as e:
+            print(f"Google API error: {e}")
+        except Exception as e:
+            print(f"General Error: {e}")
+        finally:
+            os.unlink(wav_path)
 
 # ---------------- TTS and streaming back as µ-law ----------------
 async def send_text_tts_over_ws(ws: WebSocket, stream_sid: str, text: str):
