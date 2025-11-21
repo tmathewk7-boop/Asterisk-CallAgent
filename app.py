@@ -9,6 +9,7 @@ Notes:
 - Do NOT call Twilio REST to change TwiML mid-call (that will tear down streaming).
 - Make sure PUBLIC_URL is reachable by Twilio and uses wss/http/https accordingly.
 """
+import wave
 import functools
 import os
 import base64
@@ -214,94 +215,95 @@ async def media_ws_endpoint(ws: WebSocket):
 # ---------------- Audio processing pipeline ----------------
 async def handle_audio_chunk(call_sid: str, stream_sid: str, audio_ulaw: bytes):
     """
-    Free Mode Processing:
-    1. VAD: Waits for you to stop speaking.
-    2. STT: Uses Google Free API to transcribe.
-    3. Brain: Uses keywords to reply.
+    Debug Mode Processing:
+    1. uses 'wave' (no pydub/ffmpeg needed) to save file.
+    2. prints loud debug steps.
     """
-    # 1. Analyze Volume for VAD
-    pcm16 = audioop.ulaw2lin(audio_ulaw, 2)
-    rms = audioop.rms(pcm16, 2)
-    
-    # Tuning: < 1000 is usually silence. > 1000 is speech.
-    SILENCE_THRESHOLD = 1000 
-
-    if rms > SILENCE_THRESHOLD:
-        # You are speaking
-        silence_counter[call_sid] = 0
-        full_sentence_buffer[call_sid].extend(pcm16)
-        print(f"[{call_sid}] Speaking... Vol: {rms}")
-        return
-    else:
-        # You are silent
-        silence_counter[call_sid] += 1
-
-    # 2. Process if we have audio AND ~1 second (3 chunks) of silence
-    if silence_counter[call_sid] >= 3 and len(full_sentence_buffer[call_sid]) > 0:
-        print(f"[{call_sid}] Silence detected. Processing sentence...")
+    try:
+        # 1. Analyze Volume
+        pcm16 = audioop.ulaw2lin(audio_ulaw, 2)
+        rms = audioop.rms(pcm16, 2)
         
-        # Prepare the audio for Google
-        complete_audio = bytes(full_sentence_buffer[call_sid])
-        full_sentence_buffer[call_sid].clear()
-        silence_counter[call_sid] = 0
+        # LOWER threshold to ensure it hears you. 
+        # If it triggers too much, raise to 800 or 1000.
+        SILENCE_THRESHOLD = 500 
 
-        # Save to temp WAV
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-            wav_path = tf.name
+        if rms > SILENCE_THRESHOLD:
+            silence_counter[call_sid] = 0
+            full_sentence_buffer[call_sid].extend(pcm16)
+            print(f"[{call_sid}] ... speaking (Vol: {rms})")
+            return
+        else:
+            silence_counter[call_sid] += 1
+
+        # 2. Check if we have a sentence to process
+        # (Wait for 3 chunks of silence = ~1 second)
+        if silence_counter[call_sid] >= 3 and len(full_sentence_buffer[call_sid]) > 0:
+            print(f"[{call_sid}] --- STEP 1: Silence detected, processing ---")
             
-        # Export PCM to WAV (Google needs WAV)
-        AudioSegment(
-            data=complete_audio, 
-            sample_width=2, 
-            frame_rate=SAMPLE_RATE, 
-            channels=1
-        ).export(wav_path, format="wav")
+            complete_audio = bytes(full_sentence_buffer[call_sid])
+            full_sentence_buffer[call_sid].clear()
+            silence_counter[call_sid] = 0
 
-        try:
-            # 3. RUN TRANSCRIPTION (Free Google API)
-            print(f"[{call_sid}] Sending to Google STT...")
-            loop = asyncio.get_running_loop()
-            
-            # Run in background thread (network request)
-            def recognize_speech():
-                with sr.AudioFile(wav_path) as source:
-                    audio_data = recognizer.record(source)
-                    # recognize_google uses a free default key
-                    return recognizer.recognize_google(audio_data)
+            # 3. Save WAV using NATIVE python library (Safer than Pydub)
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+                wav_path = tf.name
 
-            transcript = await loop.run_in_executor(None, recognize_speech)
-            print(f"[{call_sid}] You said: '{transcript}'")
+            try:
+                print(f"[{call_sid}] --- STEP 2: Saving WAV file ---")
+                with wave.open(wav_path, 'wb') as wav_file:
+                    wav_file.setnchannels(1)
+                    wav_file.setsampwidth(2) # 16-bit
+                    wav_file.setframerate(SAMPLE_RATE) # 8000
+                    wav_file.writeframes(complete_audio)
+                
+                # 4. Send to Google
+                print(f"[{call_sid}] --- STEP 3: Sending to Google STT ---")
+                
+                loop = asyncio.get_running_loop()
+                def recognize_speech():
+                    # Re-initialize recognizer inside thread to be safe
+                    r = sr.Recognizer()
+                    with sr.AudioFile(wav_path) as source:
+                        audio_data = r.record(source)
+                        # recognize_google is blocking, so we run in thread
+                        return r.recognize_google(audio_data)
 
-            # 4. THE BRAIN (Simple Logic)
-            text = transcript.lower()
-            response_text = "I heard you, but I am not sure what to say."
+                transcript = await loop.run_in_executor(None, recognize_speech)
+                print(f"[{call_sid}] --- STEP 4: Google said: '{transcript}' ---")
 
-            if "hello" in text or "hi" in text:
-                response_text = "Hello there! I am a free AI bot."
-            elif "how are you" in text:
-                response_text = "I am doing well, running on simple python logic."
-            elif "time" in text:
-                now = datetime.datetime.now().strftime("%I:%M %p")
-                response_text = f"The current time is {now}."
-            elif "weather" in text:
-                response_text = "I cannot check the weather yet, but I hope it is sunny."
-            else:
-                # Echo back what they said
-                response_text = f"You said: {transcript}"
+                # 5. The Brain (Keyword Matching)
+                text = transcript.lower()
+                response_text = f"You said {text}, but I don't have a specific answer for that."
 
-            # 5. SPEAK BACK
-            ws = media_ws_map.get(call_sid)
-            if ws:
-                await send_text_tts_over_ws(ws, stream_sid, response_text)
+                if "hello" in text or "hi" in text:
+                    response_text = "Hello! I can hear you perfectly now."
+                elif "time" in text:
+                    now = datetime.datetime.now().strftime("%I:%M %p")
+                    response_text = f"The time is {now}."
+                elif "banana" in text:
+                    response_text = "I heard you say Banana. It works!"
 
-        except sr.UnknownValueError:
-            print("Google could not understand audio")
-        except sr.RequestError as e:
-            print(f"Google API error: {e}")
-        except Exception as e:
-            print(f"General Error: {e}")
-        finally:
-            os.unlink(wav_path)
+                # 6. Speak Back
+                print(f"[{call_sid}] --- STEP 5: Replying '{response_text}' ---")
+                ws = media_ws_map.get(call_sid)
+                if ws:
+                    await send_text_tts_over_ws(ws, stream_sid, response_text)
+
+            except sr.UnknownValueError:
+                print(f"[{call_sid}] Google Error: Could not understand audio (maybe too quiet?)")
+            except sr.RequestError as e:
+                print(f"[{call_sid}] Google Error: Connection failed {e}")
+            except Exception as e:
+                print(f"[{call_sid}] CRASH during processing: {e}")
+            finally:
+                try:
+                    os.unlink(wav_path)
+                except:
+                    pass
+
+    except Exception as e:
+        print(f"[{call_sid}] CRASH in handle_audio_chunk: {e}")
 
 # ---------------- TTS and streaming back as µ-law ----------------
 async def send_text_tts_over_ws(ws: WebSocket, stream_sid: str, text: str):
