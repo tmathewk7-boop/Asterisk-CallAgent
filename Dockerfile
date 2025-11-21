@@ -2,11 +2,12 @@
 FROM python:3.11-slim
 
 # 1. Install system dependencies
+# ADDED: ca-certificates (Required for Edge-TTS to work)
 RUN apt-get update && \
-    apt-get install -y ffmpeg build-essential && \
+    apt-get install -y ffmpeg build-essential ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-# --- NEW LINE: Force logs to show up immediately ---
+# Force logs to show (Debugging)
 ENV PYTHONUNBUFFERED=1
 
 # 2. Set up the app directory
@@ -22,6 +23,6 @@ COPY . .
 # 5. Expose the port
 EXPOSE 8000
 
-# 6. Run the app (Make sure 'app:app' matches your filename 'app.py')
+# 6. Run the app
 CMD sh -c "uvicorn app:app --host 0.0.0.0 --port ${PORT:-8000}"
 
