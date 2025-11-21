@@ -16,3 +16,4 @@ groq
 edge-tts
 speechrecognition
 google-generativeai
+httpx
