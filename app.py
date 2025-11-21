@@ -253,38 +253,50 @@ async def handle_audio_chunk(call_sid: str, stream_sid: str, audio_ulaw: bytes):
 # ---------------- TTS and streaming back as µ-law ----------------
 async def send_text_tts_over_ws(ws: WebSocket, stream_sid: str, text: str):
     """
-    Generate TTS (gTTS -> mp3), convert to PCM 16-bit @8kHz mono,
-    convert to µ-law bytes, and stream them to Twilio over the media websocket.
+    Optimized TTS Sender:
+    - Reduces volume by 10dB to prevent static/clipping.
+    - Streams faster than real-time to prevent lag/stutter.
     """
     print("Generating TTS:", text)
-    # create temp mp3
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
         mp3_path = tf.name
     try:
+        # 1. Generate MP3 (gTTS takes ~1-2 seconds, this is the main delay source)
         gTTS(text=text, lang="en").save(mp3_path)
 
-        # load via pydub and convert to PCM16 @8kHz mono
+        # 2. Process Audio with Pydub
         audio = AudioSegment.from_file(mp3_path)
+        
+        # --- FIX 1: REDUCE VOLUME (Fixes Static) ---
+        # Phone lines distort loud audio. We lower it by 10 decibels.
+        audio = audio - 10 
+        
+        # Convert to PCM 16-bit @8kHz mono
         audio = audio.set_frame_rate(SAMPLE_RATE).set_channels(1).set_sample_width(2)
-        pcm16 = audio.raw_data  # little-endian 16-bit PCM
+        pcm16 = audio.raw_data
 
-        # convert to µ-law bytes
+        # 3. Convert to µ-law
         ulaw_bytes = audioop.lin2ulaw(pcm16, 2)
 
-        # send in small chunks (keep under ~1 KB; Twilio handles small packets)
-        chunk_size = 160  # 20 ms at 8kHz -> 160 samples -> 160 bytes of µ-law
+        # 4. Stream to Twilio
+        chunk_size = 160  # 160 bytes = 20ms of audio
         for i in range(0, len(ulaw_bytes), chunk_size):
             chunk = ulaw_bytes[i:i + chunk_size]
             payload = base64.b64encode(chunk).decode("ascii")
+            
             msg = {
                 "event": "media",
                 "streamSid": stream_sid,
                 "media": {"payload": payload}
             }
             await ws.send_json(msg)
-            await asyncio.sleep(0.02)  # pace the stream
+            
+            # --- FIX 2: STREAM FASTER (Fixes Stutter/Lag) ---
+            # Old code: 0.02 (Exact speed -> fragile)
+            # New code: 0.005 (4x speed -> builds a safety buffer)
+            await asyncio.sleep(0.005)
 
-        # optional mark event
+        # Optional: Mark event
         try:
             await ws.send_json({
                 "event": "mark",
