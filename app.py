@@ -174,14 +174,43 @@ def save_optimized_wav(pcm_bytes, path):
     audio = audio.set_frame_rate(16000)
     audio.export(path, format="wav")
 
-def transcribe_audio(path):
-    r = sr.Recognizer()
-    with sr.AudioFile(path) as source:
-        audio = r.record(source)
-        try:
-            return r.recognize_google(audio)
-        except:
+def transcribe_audio(wav_path):
+    """
+    Uses Deepgram Nova-2 for lightning fast Speech-to-Text.
+    Replaces the flaky Google Free API.
+    """
+    if not DEEPGRAM_API_KEY:
+        print("Error: DEEPGRAM_API_KEY missing for STT.")
+        return None
+
+    try:
+        # Deepgram "Nova-2" is their fastest, most accurate model for phone calls
+        url = "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true"
+        
+        headers = {
+            "Authorization": f"Token {DEEPGRAM_API_KEY}",
+            "Content-Type": "audio/wav"
+        }
+
+        with open(wav_path, "rb") as audio_file:
+            response = requests.post(url, headers=headers, data=audio_file)
+
+        if response.status_code != 200:
+            print(f"Deepgram STT Error: {response.text}")
             return None
+
+        data = response.json()
+        # Extract the transcript text
+        transcript = data['results']['channels'][0]['alternatives'][0]['transcript']
+        
+        if not transcript:
+            return None
+            
+        return transcript
+
+    except Exception as e:
+        print(f"Transcribe Error: {e}")
+        return None
 
 # ---------------- The Brain ----------------
 def generate_smart_response(user_text):
