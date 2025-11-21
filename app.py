@@ -4,7 +4,7 @@ import json
 import tempfile
 import asyncio
 import audioop
-import requests  # pip install requests
+import requests
 from pathlib import Path
 from collections import defaultdict
 
@@ -21,7 +21,7 @@ import uvicorn
 
 # ---------- Configuration ----------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY") # <--- NEW KEY
+DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 PORT = int(os.getenv("PORT", 8000))
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://your-app.onrender.com")
 
@@ -86,8 +86,8 @@ async def media_ws_endpoint(ws: WebSocket):
                 media_ws_map[call_sid] = ws
                 print(f"[{call_sid}] Stream started")
                 
-                # Send welcome using Deepgram (Human Voice)
-                await send_deepgram_tts(ws, stream_sid, "Hello! I am online.")
+                # Send welcome
+                await send_deepgram_tts(ws, stream_sid, "Hello! I'm listening.")
                 continue
 
             if event == "media":
@@ -108,20 +108,18 @@ async def media_ws_endpoint(ws: WebSocket):
         if call_sid in media_ws_map: del media_ws_map[call_sid]
         if call_sid in full_sentence_buffer: del full_sentence_buffer[call_sid]
 
-# ---------------- VAD & Listener ----------------
+# ---------------- VAD & Listener (TUNED) ----------------
 async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes):
     """
-    Tuned for Snappy Response:
-    - Lowers threshold to catch quiet voices.
-    - Lowers pause time to reply instantly.
+    Tuned VAD:
+    - Sensitivity: High (Threshold 600) to catch start of words.
+    - Patience: Medium (35 chunks = 0.7s) to avoid cutting you off.
     """
     pcm16 = audioop.ulaw2lin(audio_ulaw, 2)
     rms = audioop.rms(pcm16, 2)
     
-    # 1. INCREASE SENSITIVITY
-    # Old: 2000 (Misses quiet words)
-    # New: 1000 (Hear everything, relying on Deepgram to filter noise)
-    SILENCE_THRESHOLD = 1000 
+    # FIX 1: Lower threshold to catch "Whats the..." (quiet starts)
+    SILENCE_THRESHOLD = 600 
 
     if rms > SILENCE_THRESHOLD:
         silence_counter[call_sid] = 0
@@ -129,37 +127,29 @@ async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes
     else:
         silence_counter[call_sid] += 1
 
-    # 2. MAKE IT INSTANT
-    # Twilio sends chunks every 20ms.
-    # Old: 50 chunks = 1.0 second wait (Too slow!)
-    # New: 25 chunks = 0.5 second wait (Conversational)
-    PAUSE_LIMIT = 25 
+    # FIX 2: Increase pause limit slightly (0.5s -> 0.7s)
+    # This prevents cutting off "...in Calgary"
+    PAUSE_LIMIT = 35
     
     if silence_counter[call_sid] >= PAUSE_LIMIT:
-        # Only process if we have a meaningful amount of audio (>0.25s)
         if len(full_sentence_buffer[call_sid]) > 4000: 
             complete_audio = bytes(full_sentence_buffer[call_sid])
             full_sentence_buffer[call_sid].clear()
             silence_counter[call_sid] = 0
             asyncio.create_task(handle_complete_sentence(call_sid, stream_sid, complete_audio))
         else:
-            # Just a click or pop, clear it
             if len(full_sentence_buffer[call_sid]) > 0:
                 full_sentence_buffer[call_sid].clear()
             silence_counter[call_sid] = 0
 
 async def handle_complete_sentence(call_sid: str, stream_sid: str, pcm_bytes: bytes):
     print(f"[{call_sid}] Processing speech...")
-    
     with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
         wav_path = tf.name
 
     try:
         loop = asyncio.get_running_loop()
-        # 1. Save WAV
         await loop.run_in_executor(None, lambda: save_optimized_wav(pcm_bytes, wav_path))
-
-        # 2. Transcribe (Google)
         transcript = await loop.run_in_executor(None, lambda: transcribe_audio(wav_path))
         
         if not transcript:
@@ -167,11 +157,8 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, pcm_bytes: by
             return
 
         print(f"[{call_sid}] User said: '{transcript}'")
-
-        # 3. Brain (Groq)
         response_text = generate_smart_response(transcript)
         
-        # 4. Speak (Deepgram Aura)
         ws = media_ws_map.get(call_sid)
         if ws:
             await send_deepgram_tts(ws, stream_sid, response_text)
@@ -189,104 +176,68 @@ def save_optimized_wav(pcm_bytes, path):
     audio.export(path, format="wav")
 
 def transcribe_audio(wav_path):
-    """
-    Uses Deepgram Nova-2 for lightning fast Speech-to-Text.
-    Replaces the flaky Google Free API.
-    """
     if not DEEPGRAM_API_KEY:
-        print("Error: DEEPGRAM_API_KEY missing for STT.")
+        print("Error: DEEPGRAM_API_KEY missing.")
         return None
-
     try:
-        # Deepgram "Nova-2" is their fastest, most accurate model for phone calls
         url = "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true"
-        
-        headers = {
-            "Authorization": f"Token {DEEPGRAM_API_KEY}",
-            "Content-Type": "audio/wav"
-        }
-
+        headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "audio/wav"}
         with open(wav_path, "rb") as audio_file:
             response = requests.post(url, headers=headers, data=audio_file)
-
-        if response.status_code != 200:
-            print(f"Deepgram STT Error: {response.text}")
-            return None
-
         data = response.json()
-        # Extract the transcript text
-        transcript = data['results']['channels'][0]['alternatives'][0]['transcript']
-        
-        if not transcript:
-            return None
-            
-        return transcript
-
+        return data['results']['channels'][0]['alternatives'][0]['transcript']
     except Exception as e:
         print(f"Transcribe Error: {e}")
         return None
 
-# ---------------- The Brain ----------------
+# ---------------- The Brain (Concise) ----------------
 def generate_smart_response(user_text):
     if not groq_client: return "No brain found."
     try:
         print(f"Asking Llama: {user_text}")
+        # FIX 3: Ultra-concise prompt to reduce generation time
+        system_prompt = "You are a conversational phone assistant. Be extremely concise. Answer in 1 sentence (max 15 words). Do not use special chars."
+        
         completion = groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "You are a helpful phone assistant. Keep answers short and conversational."},
+                {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text},
             ],
             model="llama-3.1-8b-instant",
-            max_tokens=60,
+            max_tokens=50,
         )
         return completion.choices[0].message.content.strip()
     except Exception as e:
         print(f"Groq Error: {e}")
-        return "I am confused."
+        return "I didn't catch that."
 
-# ---------------- DEEPGRAM TTS (The Vapi Killer) ----------------
+# ---------------- DEEPGRAM TTS (Streaming) ----------------
 async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str):
     """
-    Uses Deepgram Aura. 
-    - Human-like breathing and intonation.
-    - Ultra low latency.
-    - Returns raw µ-law (no conversion needed!).
+    Uses Deepgram Aura with STREAMING. 
+    Sends audio chunks immediately as they arrive.
     """
-    if not DEEPGRAM_API_KEY:
-        print("Error: DEEPGRAM_API_KEY missing.")
-        return
-
-    print(f"Deepgram Generating: {text}")
+    if not DEEPGRAM_API_KEY: return
+    print(f"Deepgram Streaming: {text}")
     
-    # We use the REST API directly because it's faster/simpler than the SDK for this
     url = "https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000&container=none"
-    
-    headers = {
-        "Authorization": f"Token {DEEPGRAM_API_KEY}",
-        "Content-Type": "application/json"
-    }
+    headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "application/json"}
     payload = {"text": text}
 
     try:
-        # Run request in background thread
         loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(None, lambda: requests.post(url, headers=headers, json=payload))
+        # FIX 4: Use stream=True to get data instantly
+        response = await loop.run_in_executor(None, lambda: requests.post(url, headers=headers, json=payload, stream=True))
 
-        if response.status_code != 200:
-            print(f"Deepgram Error: {response.text}")
-            return
-
-        # Deepgram returns raw audio bytes in the exact format Twilio needs!
-        audio_data = response.content
-
-        # Send to Twilio
-        chunk_size = 1600 
-        for i in range(0, len(audio_data), chunk_size):
-            chunk = audio_data[i:i + chunk_size]
-            payload = base64.b64encode(chunk).decode("ascii")
-            await ws.send_json({
-                "event": "media", "streamSid": stream_sid, "media": {"payload": payload}
-            })
+        # Stream chunks directly to websocket
+        for chunk in response.iter_content(chunk_size=1600):
+            if chunk:
+                payload = base64.b64encode(chunk).decode("ascii")
+                await ws.send_json({
+                    "event": "media", "streamSid": stream_sid, "media": {"payload": payload}
+                })
+                # Tiny sleep to prevent overwhelming the socket, but keeps it near real-time
+                await asyncio.sleep(0.005) 
 
     except Exception as e:
         print(f"TTS Error: {e}")
