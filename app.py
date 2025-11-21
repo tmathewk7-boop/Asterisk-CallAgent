@@ -20,7 +20,6 @@ DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 PORT = int(os.getenv("PORT", 8000))
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://your-app.onrender.com")
 
-# Initialize Groq
 if GROQ_API_KEY:
     groq_client = Groq(api_key=GROQ_API_KEY)
 else:
@@ -32,15 +31,36 @@ app.add_middleware(
 )
 
 # ---------- DATABASE (In-Memory) ----------
-# In a real app, you would use SQLite or Postgres. 
-# For now, we store calls in a list.
-call_db = {}      # Stores metadata: {call_sid: {number: "...", summary: "..."}}
-transcripts = defaultdict(list) # Stores chat history: {call_sid: ["User: hi", "AI: hello"]}
+call_db = {}      
+transcripts = defaultdict(list) 
 media_ws_map = {}
 silence_counter = defaultdict(int)
 full_sentence_buffer = defaultdict(bytearray)
 
-# ---------------- DASHBOARD HTML ----------------
+# ---------------- API FOR YOUR .EXE ----------------
+@app.get("/api/calls")
+async def get_calls_json():
+    """
+    YOUR .EXE SHOULD FETCH THIS URL.
+    Returns a JSON list of all calls:
+    [
+      {
+        "sid": "CA123...",
+        "timestamp": "14:30:01",
+        "number": "+1555...",
+        "location": "Saskatoon, SK",
+        "status": "Ended",
+        "summary": "Caller asked about weather."
+      },
+      ...
+    ]
+    """
+    # Convert dict to list, sorted by newest first
+    calls_list = list(call_db.values())
+    calls_list.reverse() 
+    return calls_list
+
+# ---------------- WEB DASHBOARD ----------------
 @app.get("/dashboard", response_class=HTMLResponse)
 async def get_dashboard():
     return """
@@ -48,79 +68,93 @@ async def get_dashboard():
     <html>
     <head>
         <title>AI Call Dashboard</title>
-        <meta http-equiv="refresh" content="5"> <style>
-            body { font-family: sans-serif; background: #f4f4f9; padding: 20px; }
-            h1 { color: #333; }
-            table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
-            th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
-            th { background-color: #007bff; color: white; }
-            tr:hover { background-color: #f1f1f1; }
-            .status-live { color: green; font-weight: bold; }
-            .status-ended { color: #666; }
+        <meta http-equiv="refresh" content="10">
+        <style>
+            body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: #f4f4f9; padding: 40px; }
+            .container { max-width: 1000px; margin: 0 auto; background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 10px rgba(0,0,0,0.1); }
+            h1 { margin-bottom: 20px; color: #333; }
+            table { width: 100%; border-collapse: collapse; }
+            th { text-align: left; padding: 12px; border-bottom: 2px solid #eee; color: #666; font-size: 0.9em; text-transform: uppercase; }
+            td { padding: 12px; border-bottom: 1px solid #eee; vertical-align: top; }
+            tr:last-child td { border-bottom: none; }
+            .status-live { color: #00c853; font-weight: bold; padding: 4px 8px; background: #e8f5e9; border-radius: 12px; font-size: 0.85em; }
+            .status-ended { color: #616161; font-weight: bold; padding: 4px 8px; background: #f5f5f5; border-radius: 12px; font-size: 0.85em; }
+            .summary { color: #444; font-style: italic; }
         </style>
     </head>
     <body>
-        <h1>📞 Live Call Dashboard</h1>
-        <table id="callTable">
-            <thead>
-                <tr>
-                    <th>Time</th>
-                    <th>Caller Number</th>
-                    <th>Location</th>
-                    <th>Status</th>
-                    <th>Summary / Transcript</th>
-                </tr>
-            </thead>
-            <tbody id="tableBody">
+        <div class="container">
+            <h1>📞 Live Call Logs</h1>
+            <table>
+                <thead>
+                    <tr>
+                        <th>Time</th>
+                        <th>Caller</th>
+                        <th>Location</th>
+                        <th>Status</th>
+                        <th>AI Summary</th>
+                    </tr>
+                </thead>
+                <tbody id="tableBody">
+                    <tr><td colspan="5" style="text-align:center; color:#999;">Loading data...</td></tr>
                 </tbody>
-        </table>
+            </table>
+        </div>
 
         <script>
-            async def fetchCalls() {
-                const response = await fetch('/api/calls');
-                const calls = await response.json();
-                const tbody = document.getElementById('tableBody');
-                tbody.innerHTML = '';
-                
-                // Sort by newest first
-                calls.reverse();
+            // FIX: 'async function', not 'async def'
+            async function fetchCalls() {
+                try {
+                    const response = await fetch('/api/calls');
+                    const calls = await response.json();
+                    const tbody = document.getElementById('tableBody');
+                    
+                    if (calls.length === 0) {
+                        tbody.innerHTML = '<tr><td colspan="5" style="text-align:center; color:#999;">No calls yet.</td></tr>';
+                        return;
+                    }
 
-                calls.forEach(call => {
-                    const row = `<tr>
-                        <td>${call.timestamp}</td>
-                        <td>${call.number}</td>
-                        <td>${call.location}</td>
-                        <td class="${call.status === 'Live' ? 'status-live' : 'status-ended'}">${call.status}</td>
-                        <td>${call.summary || "<i>Listening...</i>"}</td>
-                    </tr>`;
-                    tbody.innerHTML += row;
-                });
+                    tbody.innerHTML = '';
+
+                    calls.forEach(call => {
+                        const statusClass = call.status === 'Live' ? 'status-live' : 'status-ended';
+                        const summaryText = call.summary ? call.summary : (call.status === 'Live' ? 'Listening...' : 'Processing...');
+                        
+                        const row = `<tr>
+                            <td>${call.timestamp}</td>
+                            <td>${call.number}</td>
+                            <td>${call.location}</td>
+                            <td><span class="${statusClass}">${call.status}</span></td>
+                            <td class="summary">${summaryText}</td>
+                        </tr>`;
+                        tbody.innerHTML += row;
+                    });
+                } catch (e) {
+                    console.error("Error fetching calls:", e);
+                }
             }
+            
+            // Load immediately, then update every 2 seconds
             fetchCalls();
-            setInterval(fetchCalls, 2000); // Update every 2 seconds
+            setInterval(fetchCalls, 2000); 
         </script>
     </body>
     </html>
     """
-
-@app.get("/api/calls")
-async def get_calls_json():
-    # Convert dict to list for the frontend
-    return list(call_db.values())
 
 # ---------------- TwiML endpoint ----------------
 @app.post("/twilio/incoming")
 async def twilio_incoming(request: Request):
     form = await request.form()
     
-    # 1. CAPTURE CALL DETAILS
+    # 1. CAPTURE CALL DATA
     call_sid = form.get("CallSid")
     caller_number = form.get("From", "Unknown")
     city = form.get("FromCity", "")
     state = form.get("FromState", "")
     location = f"{city}, {state}" if city else "Unknown"
     
-    # Save to DB
+    # Add to In-Memory DB
     call_db[call_sid] = {
         "sid": call_sid,
         "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
@@ -129,7 +163,7 @@ async def twilio_incoming(request: Request):
         "status": "Live",
         "summary": None
     }
-    print(f"New Call: {caller_number} from {location}")
+    print(f"New Call: {caller_number} ({location})")
 
     host = PUBLIC_URL
     if host.startswith("https://"):
@@ -179,17 +213,17 @@ async def media_ws_endpoint(ws: WebSocket):
                 break
 
     except WebSocketDisconnect:
-        print("Client disconnected")
+        pass
     except Exception as e:
         print("Error:", e)
     finally:
         if call_sid:
-            # 2. HANDLE DISCONNECT & SUMMARIZE
+            # 2. HANDLE END OF CALL
             print(f"Call Ended: {call_sid}")
             if call_sid in call_db:
                 call_db[call_sid]["status"] = "Ended"
             
-            # Generate Summary in background
+            # Trigger Summary
             asyncio.create_task(generate_call_summary(call_sid))
 
             if call_sid in media_ws_map: del media_ws_map[call_sid]
@@ -223,13 +257,9 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
         if not transcript: return
 
         print(f"[{call_sid}] User: {transcript}")
-        
-        # 3. LOG USER SPEECH
         transcripts[call_sid].append(f"User: {transcript}")
 
         response_text = await generate_smart_response(transcript)
-        
-        # 4. LOG AI RESPONSE
         transcripts[call_sid].append(f"AI: {response_text}")
         
         ws = media_ws_map.get(call_sid)
@@ -239,43 +269,31 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
     except Exception as e:
         print(f"Error: {e}")
 
-# ---------------- SUMMARIZER (Llama 3) ----------------
+# ---------------- SUMMARIZER ----------------
 async def generate_call_summary(call_sid: str):
-    """
-    When call ends, send full transcript to Groq to summarize.
-    """
-    if not groq_client or call_sid not in transcripts:
-        return
+    if not groq_client or call_sid not in transcripts: return
 
     full_text = "\n".join(transcripts[call_sid])
     if not full_text: return
 
-    print(f"Summarizing call {call_sid}...")
-
     try:
-        system_prompt = "You are a secretary. Summarize this phone call in 1 short sentence."
-        
-        # Run Groq (Sync in thread)
+        # Ask Llama to summarize
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": system_prompt},
+                {"role": "system", "content": "Summarize this call in 6 words or less."},
                 {"role": "user", "content": full_text},
             ],
-            model="llama-3.1-8b-instant",
-            max_tokens=50,
+            model="llama-3.1-8b-instant", max_tokens=20
         ))
-        
         summary = completion.choices[0].message.content.strip()
         
-        # Update DB
         if call_sid in call_db:
             call_db[call_sid]["summary"] = summary
-        
         print(f"Summary: {summary}")
 
-    except Exception as e:
-        print(f"Summary failed: {e}")
+    except Exception:
+        pass
 
 # ---------------- HELPERS ----------------
 async def transcribe_raw_audio(raw_ulaw):
