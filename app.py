@@ -9,6 +9,7 @@ Notes:
 - Do NOT call Twilio REST to change TwiML mid-call (that will tear down streaming).
 - Make sure PUBLIC_URL is reachable by Twilio and uses wss/http/https accordingly.
 """
+import functools
 import os
 import base64
 import asyncio
@@ -254,23 +255,33 @@ async def handle_audio_chunk(call_sid: str, stream_sid: str, audio_ulaw: bytes):
 async def send_text_tts_over_ws(ws: WebSocket, stream_sid: str, text: str):
     """
     Optimized TTS Sender:
-    - Reduces volume by 10dB to prevent static/clipping.
-    - Streams faster than real-time to prevent lag/stutter.
+    1. NON-BLOCKING: Generates audio in a thread so the stream doesn't freeze.
+    2. LOW-PASS FILTER: Removes high frequencies that cause static on phone lines.
     """
-    print("Generating TTS:", text)
+    print(f"Generating TTS: {text}")
     with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
         mp3_path = tf.name
+
     try:
-        # 1. Generate MP3 (gTTS takes ~1-2 seconds, this is the main delay source)
-        gTTS(text=text, lang="en").save(mp3_path)
+        # --- FIX 1: Non-Blocking Generation (Fixes the "Hiccup/Lag") ---
+        # We run gTTS in a separate thread so the main server loop doesn't freeze.
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(
+            None, 
+            lambda: gTTS(text=text, lang="en").save(mp3_path)
+        )
 
         # 2. Process Audio with Pydub
         audio = AudioSegment.from_file(mp3_path)
         
-        # --- FIX 1: REDUCE VOLUME (Fixes Static) ---
-        # Phone lines distort loud audio. We lower it by 10 decibels.
-        audio = audio - 10 
+        # --- FIX 2: Low Pass Filter (Fixes the "Static") ---
+        # Phone lines are 8kHz, meaning they can only play freq up to 4kHz.
+        # Anything above 3.5kHz becomes nasty static (aliasing). We cut it off here.
+        audio = audio.low_pass_filter(3000) 
         
+        # Reduce volume slightly to prevent clipping
+        audio = audio - 5
+
         # Convert to PCM 16-bit @8kHz mono
         audio = audio.set_frame_rate(SAMPLE_RATE).set_channels(1).set_sample_width(2)
         pcm16 = audio.raw_data
@@ -279,7 +290,8 @@ async def send_text_tts_over_ws(ws: WebSocket, stream_sid: str, text: str):
         ulaw_bytes = audioop.lin2ulaw(pcm16, 2)
 
         # 4. Stream to Twilio
-        chunk_size = 160  # 160 bytes = 20ms of audio
+        # 160 bytes = 20ms of audio
+        chunk_size = 160
         for i in range(0, len(ulaw_bytes), chunk_size):
             chunk = ulaw_bytes[i:i + chunk_size]
             payload = base64.b64encode(chunk).decode("ascii")
@@ -291,10 +303,8 @@ async def send_text_tts_over_ws(ws: WebSocket, stream_sid: str, text: str):
             }
             await ws.send_json(msg)
             
-            # --- FIX 2: STREAM FASTER (Fixes Stutter/Lag) ---
-            # Old code: 0.02 (Exact speed -> fragile)
-            # New code: 0.005 (4x speed -> builds a safety buffer)
-            await asyncio.sleep(0.005)
+            # Sleep 0.01s (Send audio 2x faster than real-time to keep buffer full but not flooded)
+            await asyncio.sleep(0.01)
 
         # Optional: Mark event
         try:
@@ -306,12 +316,12 @@ async def send_text_tts_over_ws(ws: WebSocket, stream_sid: str, text: str):
         except Exception:
             pass
 
-        print("TTS streaming finished")
     except Exception as e:
         print("TTS generation/streaming error:", e)
     finally:
         try:
-            os.unlink(mp3_path)
+            if os.path.exists(mp3_path):
+                os.unlink(mp3_path)
         except Exception:
             pass
 
