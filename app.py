@@ -120,22 +120,27 @@ def pcm16_bytes_to_ulaw_bytes(pcm16_bytes: bytes) -> bytes:
 async def twilio_incoming(request: Request):
     form = await request.form()
     call_sid = form.get("CallSid")
-    from_number = form.get("From")
-    print(f"Incoming call from {from_number} CallSid {call_sid}")
+    print(f"Incoming call CallSid: {call_sid}")
 
-    # Use <Start><Stream> TwiML to open a media websocket to our /media-ws endpoint.
-    # Twilio expects a WSS URL when it connects; Twilio will connect using its own transport.
+    # FIX 1: Ensure the URL uses wss:// (Twilio requires wss for media streams)
+    host = PUBLIC_URL
+    if host.startswith("https://"):
+        host = host.replace("https://", "wss://")
+    elif host.startswith("http://"):
+        host = host.replace("http://", "ws://")
+    
+    stream_url = f"{host}/media-ws"
+
+    # FIX 2: Use <Connect><Stream> for bidirectional (conversational) audio.
+    # <Start> is for background listening (forking); <Connect> is for talking bots.
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Start>
-    <Stream url="{PUBLIC_URL}/media-ws"/>
-  </Start>
-  <Pause length="3600"/>
+    <Connect>
+        <Stream url="{stream_url}" />
+    </Connect>
 </Response>"""
-    
 
     return Response(content=twiml, media_type="application/xml")
-
 
 # ---------------- Media WebSocket ----------------
 @app.websocket("/media-ws")
