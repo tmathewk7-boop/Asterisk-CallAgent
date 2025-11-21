@@ -22,7 +22,7 @@ from collections import defaultdict
 from functools import partial
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import PlainTextResponse, HTMLResponse
+from fastapi.responses import PlainTextResponse, HTMLResponse, Response
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
@@ -132,7 +132,10 @@ async def twilio_incoming(request: Request):
   </Start>
   <Pause length="3600"/>
 </Response>"""
-    return PlainTextResponse(content=twiml, media_type="text/xml")
+    
+
+    return Response(content=twiml, media_type="application/xml")
+
 
 # ---------------- Media WebSocket ----------------
 @app.websocket("/media-ws")
