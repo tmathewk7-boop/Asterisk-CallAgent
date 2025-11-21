@@ -210,7 +210,7 @@ async def handle_audio_chunk(call_sid: str, stream_sid: str, audio_ulaw: bytes):
     print(f"[{call_sid}] handling audio chunk, {len(audio_ulaw)} bytes")
 
     # Convert µ-law to 16-bit PCM
-    pcm16 = ulaw_bytes_to_pcm16_bytes(audio_ulaw)
+    pcm16 = audioop.ulaw2lin(audio_ulaw, 2)
 
     # Optional: write to temp WAV for debugging
     try:
@@ -268,7 +268,7 @@ async def send_text_tts_over_ws(ws: WebSocket, stream_sid: str, text: str):
         pcm16 = audio.raw_data  # little-endian 16-bit PCM
 
         # convert to µ-law bytes
-        ulaw_bytes = pcm16_bytes_to_ulaw_bytes(pcm16)
+        ulaw_bytes = audioop.lin2ulaw(pcm16, 2)
 
         # send in small chunks (keep under ~1 KB; Twilio handles small packets)
         chunk_size = 160  # 20 ms at 8kHz -> 160 samples -> 160 bytes of µ-law
