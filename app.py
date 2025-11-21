@@ -6,7 +6,8 @@ import audioop
 import httpx
 import datetime
 from collections import defaultdict
-from pydantic import BaseModel # <-- Added this import
+from pydantic import BaseModel
+from typing import Optional
 
 # --- IMPORTS ---
 from groq import Groq
@@ -14,6 +15,9 @@ from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
+
+# --- TWILIO IMPORTS (Required for Forwarding) ---
+from twilio.twiml.voice_response import VoiceResponse, Dial
 
 # ---------- Configuration ----------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -59,14 +63,21 @@ USER_CONFIGS = load_settings()
 
 DEFAULT_CONFIG = {
     "system_prompt": "You are a helpful assistant. Be concise.",
-    "greeting": "Hello! I am your AI assistant."
+    "greeting": "Hello! I am your AI assistant.",
+    "active": True,
+    "personal_phone": "" # You can manually set this in user_settings.json
 }
 
-# ---------- API MODELS (FIXED) ----------
+# ---------- API MODELS ----------
 class AgentSettings(BaseModel):
     phone_number: str
-    system_prompt: str
-    greeting: str
+    system_prompt: Optional[str] = None
+    greeting: Optional[str] = None
+    personal_phone: Optional[str] = None
+
+class ToggleRequest(BaseModel):
+    phone_number: str
+    active: bool
 
 # ---------------- API ENDPOINTS ----------------
 
@@ -75,8 +86,6 @@ async def get_calls_for_client(target_number: str):
     """Returns calls only for the specific phone number."""
     filtered_calls = []
     for call in call_db.values():
-        # Filter by the number that was dialed (system_number)
-        # We strip any leading '+' just in case of formatting differences
         call_sys_num = call.get("system_number", "").replace(" ", "")
         target = target_number.replace(" ", "")
         
@@ -92,16 +101,43 @@ async def get_settings(target_number: str):
 
 @app.post("/api/settings")
 async def update_settings(settings: AgentSettings):
-    """Update AI settings for a user."""
+    """Update AI settings (Prompt, Greeting, Personal Phone)."""
     print(f"Saving settings for {settings.phone_number}")
-    USER_CONFIGS[settings.phone_number] = {
-        "system_prompt": settings.system_prompt,
-        "greeting": settings.greeting
-    }
+    
+    # Get existing or default
+    current = USER_CONFIGS.get(settings.phone_number, DEFAULT_CONFIG.copy())
+    
+    # Update fields if provided
+    if settings.system_prompt: current["system_prompt"] = settings.system_prompt
+    if settings.greeting: current["greeting"] = settings.greeting
+    if settings.personal_phone: current["personal_phone"] = settings.personal_phone
+    
+    USER_CONFIGS[settings.phone_number] = current
     save_settings(USER_CONFIGS)
     return {"status": "success"}
 
-# ---------------- TwiML ----------------
+@app.post("/toggle")
+async def toggle_agent(req: ToggleRequest):
+    """Turn the AI ON or OFF for a specific number."""
+    phone = req.phone_number
+    
+    # Get existing config or create new default
+    current = USER_CONFIGS.get(phone, DEFAULT_CONFIG.copy())
+    
+    # Update active state
+    current["active"] = req.active
+    USER_CONFIGS[phone] = current
+    save_settings(USER_CONFIGS)
+    
+    state_str = "ON" if req.active else "OFF"
+    print(f"Toggled {phone} to {state_str}")
+    return {"status": "success", "active": req.active}
+
+@app.get("/status")
+async def server_status():
+    return {"status": "online"}
+
+# ---------------- TwiML (UPDATED FOR TOGGLE) ----------------
 @app.post("/twilio/incoming")
 async def twilio_incoming(request: Request):
     form = await request.form()
@@ -111,6 +147,27 @@ async def twilio_incoming(request: Request):
     
     # Load User Config
     config = USER_CONFIGS.get(system_number, DEFAULT_CONFIG)
+    
+    # --- CHECK IF AI IS ACTIVE ---
+    is_active = config.get("active", True)
+    
+    if not is_active:
+        # === AI OFF: CALL FORWARDING LOGIC ===
+        print(f"AI is OFF for {system_number}. Forwarding call...")
+        response = VoiceResponse()
+        
+        personal_phone = config.get("personal_phone")
+        
+        if personal_phone:
+            response.say("Connecting you to the user.")
+            response.dial(personal_phone)
+        else:
+            # Fallback if no forwarding number is set
+            response.say("The person you are calling is unavailable and has not set a forwarding number.")
+            
+        return Response(content=str(response), media_type="application/xml")
+
+    # === AI ON: WEBSOCKET LOGIC ===
     active_call_config[call_sid] = config
 
     # Log Call
@@ -122,12 +179,12 @@ async def twilio_incoming(request: Request):
         "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
         "number": caller_number,
         "system_number": system_number,
-        "client_name": "My Agent", # Generic name since we removed the hardcoded list
+        "client_name": "Client",
         "location": location,
         "status": "Live",
         "summary": None
     }
-    print(f"New Call: {caller_number} -> {system_number}")
+    print(f"New Call (AI Active): {caller_number} -> {system_number}")
 
     host = PUBLIC_URL
     if host.startswith("https://"): host = host.replace("https://", "wss://")
