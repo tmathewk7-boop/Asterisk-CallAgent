@@ -3,14 +3,14 @@ import base64
 import json
 import asyncio
 import audioop
-import httpx # pip install httpx
+import httpx
+import datetime
 from collections import defaultdict
 
 # --- IMPORTS ---
 from groq import Groq
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import Response
-from fastapi.staticfiles import StaticFiles
+from fastapi.responses import Response, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -31,15 +31,106 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
-# State
+# ---------- DATABASE (In-Memory) ----------
+# In a real app, you would use SQLite or Postgres. 
+# For now, we store calls in a list.
+call_db = {}      # Stores metadata: {call_sid: {number: "...", summary: "..."}}
+transcripts = defaultdict(list) # Stores chat history: {call_sid: ["User: hi", "AI: hello"]}
 media_ws_map = {}
 silence_counter = defaultdict(int)
 full_sentence_buffer = defaultdict(bytearray)
+
+# ---------------- DASHBOARD HTML ----------------
+@app.get("/dashboard", response_class=HTMLResponse)
+async def get_dashboard():
+    return """
+    <!DOCTYPE html>
+    <html>
+    <head>
+        <title>AI Call Dashboard</title>
+        <meta http-equiv="refresh" content="5"> <style>
+            body { font-family: sans-serif; background: #f4f4f9; padding: 20px; }
+            h1 { color: #333; }
+            table { width: 100%; border-collapse: collapse; background: white; box-shadow: 0 0 10px rgba(0,0,0,0.1); }
+            th, td { padding: 12px; text-align: left; border-bottom: 1px solid #ddd; }
+            th { background-color: #007bff; color: white; }
+            tr:hover { background-color: #f1f1f1; }
+            .status-live { color: green; font-weight: bold; }
+            .status-ended { color: #666; }
+        </style>
+    </head>
+    <body>
+        <h1>📞 Live Call Dashboard</h1>
+        <table id="callTable">
+            <thead>
+                <tr>
+                    <th>Time</th>
+                    <th>Caller Number</th>
+                    <th>Location</th>
+                    <th>Status</th>
+                    <th>Summary / Transcript</th>
+                </tr>
+            </thead>
+            <tbody id="tableBody">
+                </tbody>
+        </table>
+
+        <script>
+            async def fetchCalls() {
+                const response = await fetch('/api/calls');
+                const calls = await response.json();
+                const tbody = document.getElementById('tableBody');
+                tbody.innerHTML = '';
+                
+                // Sort by newest first
+                calls.reverse();
+
+                calls.forEach(call => {
+                    const row = `<tr>
+                        <td>${call.timestamp}</td>
+                        <td>${call.number}</td>
+                        <td>${call.location}</td>
+                        <td class="${call.status === 'Live' ? 'status-live' : 'status-ended'}">${call.status}</td>
+                        <td>${call.summary || "<i>Listening...</i>"}</td>
+                    </tr>`;
+                    tbody.innerHTML += row;
+                });
+            }
+            fetchCalls();
+            setInterval(fetchCalls, 2000); // Update every 2 seconds
+        </script>
+    </body>
+    </html>
+    """
+
+@app.get("/api/calls")
+async def get_calls_json():
+    # Convert dict to list for the frontend
+    return list(call_db.values())
 
 # ---------------- TwiML endpoint ----------------
 @app.post("/twilio/incoming")
 async def twilio_incoming(request: Request):
     form = await request.form()
+    
+    # 1. CAPTURE CALL DETAILS
+    call_sid = form.get("CallSid")
+    caller_number = form.get("From", "Unknown")
+    city = form.get("FromCity", "")
+    state = form.get("FromState", "")
+    location = f"{city}, {state}" if city else "Unknown"
+    
+    # Save to DB
+    call_db[call_sid] = {
+        "sid": call_sid,
+        "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+        "number": caller_number,
+        "location": location,
+        "status": "Live",
+        "summary": None
+    }
+    print(f"New Call: {caller_number} from {location}")
+
     host = PUBLIC_URL
     if host.startswith("https://"):
         host = host.replace("https://", "wss://")
@@ -61,7 +152,6 @@ async def media_ws_endpoint(ws: WebSocket):
     await ws.accept()
     call_sid = None
     stream_sid = None
-    print("Media WS connected")
 
     try:
         while True:
@@ -73,7 +163,6 @@ async def media_ws_endpoint(ws: WebSocket):
                 call_sid = data["start"].get("callSid")
                 stream_sid = data["start"].get("streamSid")
                 media_ws_map[call_sid] = ws
-                print(f"[{call_sid}] Stream started")
                 
                 # Send welcome
                 await send_deepgram_tts(ws, stream_sid, "Hello! I'm listening.")
@@ -90,41 +179,38 @@ async def media_ws_endpoint(ws: WebSocket):
                 break
 
     except WebSocketDisconnect:
-        print("Media WS disconnected")
+        print("Client disconnected")
     except Exception as e:
-        print("Media WS error:", e)
+        print("Error:", e)
     finally:
-        if call_sid in media_ws_map: del media_ws_map[call_sid]
-        if call_sid in full_sentence_buffer: del full_sentence_buffer[call_sid]
+        if call_sid:
+            # 2. HANDLE DISCONNECT & SUMMARIZE
+            print(f"Call Ended: {call_sid}")
+            if call_sid in call_db:
+                call_db[call_sid]["status"] = "Ended"
+            
+            # Generate Summary in background
+            asyncio.create_task(generate_call_summary(call_sid))
 
-# ---------------- VAD & Listener (RAW MODE) ----------------
+            if call_sid in media_ws_map: del media_ws_map[call_sid]
+            if call_sid in full_sentence_buffer: del full_sentence_buffer[call_sid]
+
+# ---------------- LOGIC ----------------
 async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes):
-    # We only convert to PCM for the volume check (VAD)
-    # We keep the original 'audio_ulaw' for sending to Deepgram (Faster)
     pcm16 = audioop.ulaw2lin(audio_ulaw, 2)
     rms = audioop.rms(pcm16, 2)
     
-    SILENCE_THRESHOLD = 600 
-
-    if rms > SILENCE_THRESHOLD:
+    if rms > 600:
         silence_counter[call_sid] = 0
-        # Append RAW UL-AW bytes directly
         full_sentence_buffer[call_sid].extend(audio_ulaw)
     else:
         silence_counter[call_sid] += 1
 
-    # SPEED TWEAK: 20 chunks = 0.4 seconds. 
-    # This makes it interrupt you faster.
-    PAUSE_LIMIT = 20
-    
-    if silence_counter[call_sid] >= PAUSE_LIMIT:
-        # 2000 bytes of ulaw = 0.25s of audio
+    if silence_counter[call_sid] >= 20: # 0.4s pause
         if len(full_sentence_buffer[call_sid]) > 2000: 
             complete_audio = bytes(full_sentence_buffer[call_sid])
             full_sentence_buffer[call_sid].clear()
             silence_counter[call_sid] = 0
-            
-            # Run in background
             asyncio.create_task(handle_complete_sentence(call_sid, stream_sid, complete_audio))
         else:
             if len(full_sentence_buffer[call_sid]) > 0:
@@ -132,103 +218,108 @@ async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes
             silence_counter[call_sid] = 0
 
 async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: bytes):
-    print(f"[{call_sid}] Processing...")
-
     try:
-        # 1. Transcribe (Direct Raw Send)
         transcript = await transcribe_raw_audio(raw_ulaw)
-        
-        if not transcript:
-            print(f"[{call_sid}] No speech detected.")
-            return
+        if not transcript: return
 
-        print(f"[{call_sid}] User said: '{transcript}'")
+        print(f"[{call_sid}] User: {transcript}")
         
-        # 2. Brain (Groq)
+        # 3. LOG USER SPEECH
+        transcripts[call_sid].append(f"User: {transcript}")
+
         response_text = await generate_smart_response(transcript)
         
-        # 3. Speak (Deepgram Aura)
+        # 4. LOG AI RESPONSE
+        transcripts[call_sid].append(f"AI: {response_text}")
+        
         ws = media_ws_map.get(call_sid)
         if ws:
             await send_deepgram_tts(ws, stream_sid, response_text)
 
     except Exception as e:
-        print(f"Processing Error: {e}")
+        print(f"Error: {e}")
 
-async def transcribe_raw_audio(raw_ulaw):
-    if not DEEPGRAM_API_KEY: return None
-    try:
-        # Nova-2 supports raw mulaw (Twilio format) directly!
-        # This saves us the time of converting to WAV.
-        url = "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&encoding=mulaw&sample_rate=8000"
-        
-        headers = {
-            "Authorization": f"Token {DEEPGRAM_API_KEY}",
-            "Content-Type": "audio/basic" # Standard for raw audio
-        }
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=headers, content=raw_ulaw)
-            
-        data = response.json()
-        
-        if 'results' in data and 'channels' in data['results']:
-             return data['results']['channels'][0]['alternatives'][0]['transcript']
-        return None
-    except Exception as e:
-        print(f"Transcribe Error: {e}")
-        return None
+# ---------------- SUMMARIZER (Llama 3) ----------------
+async def generate_call_summary(call_sid: str):
+    """
+    When call ends, send full transcript to Groq to summarize.
+    """
+    if not groq_client or call_sid not in transcripts:
+        return
 
-# ---------------- The Brain (Async) ----------------
-async def generate_smart_response(user_text):
-    if not groq_client: return "No brain found."
+    full_text = "\n".join(transcripts[call_sid])
+    if not full_text: return
+
+    print(f"Summarizing call {call_sid}...")
+
     try:
-        print(f"Asking Llama: {user_text}")
-        system_prompt = "You are a conversational phone assistant. Be extremely concise. Answer in 1 sentence (max 15 words)."
+        system_prompt = "You are a secretary. Summarize this phone call in 1 short sentence."
         
-        # Run Groq in thread (it's sync) or use AsyncGroq if available. 
-        # For now, simple executor is fine.
+        # Run Groq (Sync in thread)
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=[
                 {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_text},
+                {"role": "user", "content": full_text},
             ],
             model="llama-3.1-8b-instant",
             max_tokens=50,
         ))
-        return completion.choices[0].message.content.strip()
+        
+        summary = completion.choices[0].message.content.strip()
+        
+        # Update DB
+        if call_sid in call_db:
+            call_db[call_sid]["summary"] = summary
+        
+        print(f"Summary: {summary}")
+
     except Exception as e:
-        print(f"Groq Error: {e}")
+        print(f"Summary failed: {e}")
+
+# ---------------- HELPERS ----------------
+async def transcribe_raw_audio(raw_ulaw):
+    if not DEEPGRAM_API_KEY: return None
+    try:
+        url = "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&encoding=mulaw&sample_rate=8000"
+        headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "audio/basic"}
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, content=raw_ulaw)
+        data = response.json()
+        if 'results' in data and 'channels' in data['results']:
+             return data['results']['channels'][0]['alternatives'][0]['transcript']
+        return None
+    except Exception:
+        return None
+
+async def generate_smart_response(user_text):
+    if not groq_client: return "Error."
+    try:
+        system_prompt = "You are a phone assistant. Be concise (1 sentence)."
+        loop = asyncio.get_running_loop()
+        completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
+            messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_text}],
+            model="llama-3.1-8b-instant", max_tokens=50
+        ))
+        return completion.choices[0].message.content.strip()
+    except Exception:
         return "I didn't catch that."
 
-# ---------------- DEEPGRAM TTS (Streaming + Async) ----------------
 async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str):
     if not DEEPGRAM_API_KEY: return
-    print(f"Deepgram Streaming: {text}")
-    
     url = "https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000&container=none"
     headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "application/json"}
     payload = {"text": text}
-
     try:
-        # Use httpx for async streaming
         async with httpx.AsyncClient() as client:
             async with client.stream("POST", url, headers=headers, json=payload) as response:
                 async for chunk in response.aiter_bytes():
                     if chunk:
                         payload = base64.b64encode(chunk).decode("ascii")
-                        await ws.send_json({
-                            "event": "media", 
-                            "streamSid": stream_sid, 
-                            "media": {"payload": payload}
-                        })
-                        # Tiny sleep is often not needed with real async streaming
-                        # But we keep a micro-sleep to be safe
+                        await ws.send_json({"event": "media", "streamSid": stream_sid, "media": {"payload": payload}})
                         await asyncio.sleep(0.001)
-
-    except Exception as e:
-        print(f"TTS Error: {e}")
+    except Exception:
+        pass
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
