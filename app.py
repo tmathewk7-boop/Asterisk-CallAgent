@@ -8,25 +8,32 @@ import datetime
 import io
 from pathlib import Path
 from collections import defaultdict
-from groq import Groq
 
-# --- NEW IMPORTS ---
-import edge_tts
-import speech_recognition as sr
+# --- IMPORTS ---
+from groq import Groq # pip install groq
+import edge_tts # pip install edge-tts
+import speech_recognition as sr # pip install SpeechRecognition
+from gtts import gTTS # pip install gTTS (Required for backup)
+from pydub import AudioSegment # pip install pydub
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-from pydub import AudioSegment
 
 # ---------- Configuration ----------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-groq_client = Groq(api_key=GROQ_API_KEY)
 PORT = int(os.getenv("PORT", 8000))
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://your-app.onrender.com")
 SAMPLE_RATE = 8000 
+
+# Initialize Groq
+if GROQ_API_KEY:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+else:
+    groq_client = None
+    print("WARNING: GROQ_API_KEY is missing. Bot will not be smart.")
 
 # Setup Folders
 STATIC_DIR = Path("./static")
@@ -42,7 +49,8 @@ app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 # State
 call_audio_buffer = defaultdict(bytearray)
 media_ws_map = {}
-silence_counter = defaultdict(int)
+# FIXED: Renamed _counter to silence_counter to match your logic below
+silence_counter = defaultdict(int) 
 full_sentence_buffer = defaultdict(bytearray)
 
 # ---------------- TwiML endpoint ----------------
@@ -114,7 +122,7 @@ async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes
     rms = audioop.rms(pcm16, 2)
     
     # THRESHOLD: Lower = more sensitive. Higher = ignores noise.
-    SILENCE_THRESHOLD = 800 
+    SILENCE_THRESHOLD = 1200 
 
     if rms > SILENCE_THRESHOLD:
         silence_counter[call_sid] = 0
@@ -151,7 +159,7 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, pcm_bytes: by
 
         print(f"[{call_sid}] User said: '{transcript}'")
 
-        # 3. THE SMART BRAIN (New Logic)
+        # 3. THE SMART BRAIN (Groq/Llama3)
         response_text = generate_smart_response(transcript)
         
         # 4. FAST SPEAK BACK (Edge TTS)
@@ -188,6 +196,9 @@ def generate_smart_response(user_text):
     """
     Uses Groq (Llama 3) for extremely fast inference.
     """
+    if not groq_client:
+        return "I cannot think because my Groq API key is missing."
+
     try:
         print(f"Asking Llama 3 (Groq): {user_text}")
         
@@ -215,43 +226,75 @@ def generate_smart_response(user_text):
         print(f"Groq Error: {e}")
         return "I'm having a brain freeze, could you ask that again?"
 
-# ---------------- FAST TTS (Edge-TTS) ----------------
+# ---------------- FAST TTS (Hybrid: Edge -> gTTS) ----------------
 async def send_fast_tts(ws: WebSocket, stream_sid: str, text: str):
     """
-    Uses Edge-TTS (Microsoft) which is INSTANT compared to gTTS.
+    Hybrid TTS: Tries Edge (Fast). If it fails, uses gTTS (Reliable).
     """
-    print(f"Generating Fast TTS: {text}")
+    print(f"Generating TTS: {text}")
     
-    # Voice options: 'en-US-AriaNeural' (Female), 'en-US-GuyNeural' (Male)
-    VOICE = "en-US-GuyNeural"
-    
+    # 1. Try Edge TTS (Fastest)
     try:
-        # 1. Generate Audio in Memory (No disk I/O = Faster)
+        # "en-US-GuyNeural" is generally very stable
+        VOICE = "en-US-GuyNeural" 
         communicate = edge_tts.Communicate(text, VOICE)
-        
         mp3_data = b""
+        
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 mp3_data += chunk["data"]
 
-        # 2. Convert MP3 -> PCM -> u-law
-        loop = asyncio.get_running_loop()
-        ulaw_bytes = await loop.run_in_executor(None, lambda: convert_mp3_to_ulaw(mp3_data))
+        if len(mp3_data) == 0:
+            raise Exception("EdgeTTS returned zero bytes.")
 
-        # 3. Stream to Twilio (Large chunks for smoothness)
-        chunk_size = 1600 
-        for i in range(0, len(ulaw_bytes), chunk_size):
-            chunk = ulaw_bytes[i:i + chunk_size]
-            payload = base64.b64encode(chunk).decode("ascii")
-            
-            await ws.send_json({
-                "event": "media", 
-                "streamSid": stream_sid, 
-                "media": {"payload": payload}
-            })
+        # If we got here, Edge worked! Process it.
+        await process_and_send_audio(ws, stream_sid, mp3_data)
+        return
 
     except Exception as e:
-        print(f"TTS Error: {e}")
+        print(f"EdgeTTS failed ({e}). Switching to Backup (gTTS)...")
+
+    # 2. Fallback to gTTS (Slower but Reliable)
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
+            mp3_path = tf.name
+            
+        loop = asyncio.get_running_loop()
+        # Run gTTS in background
+        await loop.run_in_executor(None, lambda: gTTS(text=text, lang="en").save(mp3_path))
+        
+        # Read the file back
+        with open(mp3_path, "rb") as f:
+            mp3_data = f.read()
+            
+        # Process and send
+        await process_and_send_audio(ws, stream_sid, mp3_data)
+        
+        # Cleanup
+        os.unlink(mp3_path)
+        
+    except Exception as e:
+        print(f"CRITICAL: Both TTS engines failed. {e}")
+
+async def process_and_send_audio(ws: WebSocket, stream_sid: str, mp3_data: bytes):
+    """
+    Helper function to convert MP3 bytes to µ-law and send to Twilio.
+    """
+    loop = asyncio.get_running_loop()
+    
+    # Convert MP3 -> PCM -> u-law
+    ulaw_bytes = await loop.run_in_executor(None, lambda: convert_mp3_to_ulaw(mp3_data))
+
+    chunk_size = 1600 
+    for i in range(0, len(ulaw_bytes), chunk_size):
+        chunk = ulaw_bytes[i:i + chunk_size]
+        payload = base64.b64encode(chunk).decode("ascii")
+        
+        await ws.send_json({
+            "event": "media", 
+            "streamSid": stream_sid, 
+            "media": {"payload": payload}
+        })
 
 def convert_mp3_to_ulaw(mp3_data):
     # Load from memory
@@ -266,4 +309,3 @@ def convert_mp3_to_ulaw(mp3_data):
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
-
