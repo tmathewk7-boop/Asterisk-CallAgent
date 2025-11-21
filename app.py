@@ -79,6 +79,9 @@ class ToggleRequest(BaseModel):
     phone_number: str
     active: bool
 
+class DeleteCallsRequest(BaseModel):
+    call_sids: list[str]
+
 # ---------------- API ENDPOINTS ----------------
 
 @app.get("/api/calls/{target_number}")
@@ -93,6 +96,21 @@ async def get_calls_for_client(target_number: str):
             filtered_calls.append(call)
     filtered_calls.reverse()
     return filtered_calls
+
+# Add this endpoint to handle the deletion
+@app.post("/api/calls/delete")
+async def delete_calls(req: DeleteCallsRequest):
+    """Deletes a list of calls from memory."""
+    deleted_count = 0
+    for sid in req.call_sids:
+        if sid in call_db:
+            del call_db[sid]
+            # Also clean up transcripts if you want
+            if sid in transcripts: del transcripts[sid]
+            deleted_count += 1
+            
+    print(f"Deleted {deleted_count} calls.")
+    return {"status": "success", "deleted": deleted_count}
 
 @app.get("/api/settings/{target_number}")
 async def get_settings(target_number: str):
