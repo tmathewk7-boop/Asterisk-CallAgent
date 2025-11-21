@@ -12,6 +12,7 @@ pydub
 gtts==2.3.2
 deepgram-sdk
 jinja2
-SpeechRecognition
 groq
-egde-tts
+edge-tts
+speechrecognition
+google-generativeai
