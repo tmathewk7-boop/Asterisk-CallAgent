@@ -6,13 +6,12 @@ import audioop
 import httpx
 import datetime
 from collections import defaultdict
-from typing import Optional
-from pydantic import BaseModel
+from pydantic import BaseModel # <-- Added this import
 
 # --- IMPORTS ---
 from groq import Groq
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
-from fastapi.responses import Response, JSONResponse
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi.responses import Response, HTMLResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
@@ -33,7 +32,7 @@ app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
-# ---------- DATABASE (In-Memory + File Persistence) ----------
+# ---------- DATABASE (Memory + File) ----------
 call_db = {}      
 transcripts = defaultdict(list) 
 media_ws_map = {}
@@ -41,15 +40,14 @@ silence_counter = defaultdict(int)
 full_sentence_buffer = defaultdict(bytearray)
 active_call_config = {} 
 
-# --- PERSISTENT SETTINGS STORAGE ---
-# Structure: { "+13065551234": { "system_prompt": "...", "greeting": "..." } }
+# --- PERSISTENT SETTINGS ---
 def load_settings():
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, "r") as f:
                 return json.load(f)
         except:
-            return {}
+            pass
     return {}
 
 def save_settings(data):
@@ -59,69 +57,63 @@ def save_settings(data):
 # Load on startup
 USER_CONFIGS = load_settings()
 
-# Default if user hasn't customized yet
 DEFAULT_CONFIG = {
     "system_prompt": "You are a helpful assistant. Be concise.",
     "greeting": "Hello! I am your AI assistant."
 }
 
-# ---------- API MODELS ----------
+# ---------- API MODELS (FIXED) ----------
 class AgentSettings(BaseModel):
     phone_number: str
     system_prompt: str
     greeting: str
 
-# ---------------- API FOR DASHBOARD ----------------
+# ---------------- API ENDPOINTS ----------------
 
 @app.get("/api/calls/{target_number}")
 async def get_calls_for_client(target_number: str):
-    """
-    Returns calls specifically for the logged-in user's phone number.
-    """
+    """Returns calls only for the specific phone number."""
     filtered_calls = []
-    # Normalize formatting if needed, strictly matching for now
     for call in call_db.values():
-        if call.get("system_number") == target_number:
+        # Filter by the number that was dialed (system_number)
+        # We strip any leading '+' just in case of formatting differences
+        call_sys_num = call.get("system_number", "").replace(" ", "")
+        target = target_number.replace(" ", "")
+        
+        if call_sys_num == target:
             filtered_calls.append(call)
     filtered_calls.reverse()
     return filtered_calls
 
 @app.get("/api/settings/{target_number}")
 async def get_settings(target_number: str):
-    """
-    Returns the current AI settings for a user.
-    """
+    """Get AI settings for a specific user."""
     return USER_CONFIGS.get(target_number, DEFAULT_CONFIG)
 
 @app.post("/api/settings")
 async def update_settings(settings: AgentSettings):
-    """
-    Updates the AI Prompt and Greeting for a specific user.
-    """
+    """Update AI settings for a user."""
+    print(f"Saving settings for {settings.phone_number}")
     USER_CONFIGS[settings.phone_number] = {
         "system_prompt": settings.system_prompt,
         "greeting": settings.greeting
     }
     save_settings(USER_CONFIGS)
-    return {"status": "success", "message": "Settings saved"}
+    return {"status": "success"}
 
-# ---------------- TwiML endpoint ----------------
+# ---------------- TwiML ----------------
 @app.post("/twilio/incoming")
 async def twilio_incoming(request: Request):
     form = await request.form()
-    
     call_sid = form.get("CallSid")
     caller_number = form.get("From", "Unknown")
-    system_number = form.get("To", "") 
+    system_number = form.get("To", "") # The number they dialed
     
-    # 1. LOAD USER CONFIG
-    # Check if this number has custom settings, otherwise use default
+    # Load User Config
     config = USER_CONFIGS.get(system_number, DEFAULT_CONFIG)
-    
-    # Save config for this specific call session
     active_call_config[call_sid] = config
 
-    # 2. LOG THE CALL
+    # Log Call
     city = form.get("FromCity", "")
     location = f"{city}, {form.get('FromState', '')}" if city else "Unknown"
     
@@ -130,11 +122,11 @@ async def twilio_incoming(request: Request):
         "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
         "number": caller_number,
         "system_number": system_number,
+        "client_name": "My Agent", # Generic name since we removed the hardcoded list
         "location": location,
         "status": "Live",
         "summary": None
     }
-    
     print(f"New Call: {caller_number} -> {system_number}")
 
     host = PUBLIC_URL
@@ -150,7 +142,7 @@ async def twilio_incoming(request: Request):
 </Response>"""
     return Response(content=twiml, media_type="application/xml")
 
-# ---------------- Media WebSocket ----------------
+# ---------------- WebSocket ----------------
 @app.websocket("/media-ws")
 async def media_ws_endpoint(ws: WebSocket):
     await ws.accept()
@@ -168,10 +160,9 @@ async def media_ws_endpoint(ws: WebSocket):
                 stream_sid = data["start"].get("streamSid")
                 media_ws_map[call_sid] = ws
                 
-                # GET CUSTOM GREETING
+                # Use Custom Greeting
                 config = active_call_config.get(call_sid, DEFAULT_CONFIG)
                 greeting = config.get("greeting", "Hello.")
-                
                 await send_deepgram_tts(ws, stream_sid, greeting)
                 continue
 
@@ -184,7 +175,7 @@ async def media_ws_endpoint(ws: WebSocket):
 
             if event == "stop":
                 break
-    except Exception as e:
+    except Exception:
         pass
     finally:
         if call_sid:
@@ -194,7 +185,7 @@ async def media_ws_endpoint(ws: WebSocket):
             if call_sid in full_sentence_buffer: del full_sentence_buffer[call_sid]
             if call_sid in active_call_config: del active_call_config[call_sid]
 
-# ---------------- LOGIC ----------------
+# ---------------- Logic ----------------
 async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes):
     pcm16 = audioop.ulaw2lin(audio_ulaw, 2)
     rms = audioop.rms(pcm16, 2)
@@ -223,7 +214,7 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
         print(f"[{call_sid}] User: {transcript}")
         transcripts[call_sid].append(f"User: {transcript}")
 
-        # GET CUSTOM PROMPT
+        # Use Custom Prompt
         config = active_call_config.get(call_sid, DEFAULT_CONFIG)
         custom_prompt = config.get("system_prompt", "You are a helpful assistant.")
 
@@ -234,10 +225,10 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
         if ws:
             await send_deepgram_tts(ws, stream_sid, response_text)
 
-    except Exception as e:
-        print(f"Error: {e}")
+    except Exception:
+        pass
 
-# ---------------- SUMMARIZER ----------------
+# ---------------- Helpers ----------------
 async def generate_call_summary(call_sid: str):
     if not groq_client or call_sid not in transcripts: return
     full_text = "\n".join(transcripts[call_sid])
@@ -245,14 +236,13 @@ async def generate_call_summary(call_sid: str):
     try:
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
-            messages=[{"role": "system", "content": "Summarize this call in 6 words."}, {"role": "user", "content": full_text}],
+            messages=[{"role": "system", "content": "Summarize call in 6 words."}, {"role": "user", "content": full_text}],
             model="llama-3.1-8b-instant", max_tokens=20
         ))
-        summary = completion.choices[0].message.content.strip()
-        if call_sid in call_db: call_db[call_sid]["summary"] = summary
+        if call_sid in call_db:
+            call_db[call_sid]["summary"] = completion.choices[0].message.content.strip()
     except Exception: pass
 
-# ---------------- HELPERS ----------------
 async def transcribe_raw_audio(raw_ulaw):
     if not DEEPGRAM_API_KEY: return None
     try:
@@ -268,8 +258,7 @@ async def transcribe_raw_audio(raw_ulaw):
 async def generate_smart_response(user_text, system_prompt):
     if not groq_client: return "Error."
     try:
-        # Force conciseness on top of user prompt
-        full_prompt = f"{system_prompt} Keep your answer to 1 short sentence (max 15 words)."
+        full_prompt = f"{system_prompt} Keep answer to 1 short sentence (max 15 words)."
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=[{"role": "system", "content": full_prompt}, {"role": "user", "content": user_text}],
