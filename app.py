@@ -110,11 +110,18 @@ async def media_ws_endpoint(ws: WebSocket):
 
 # ---------------- VAD & Listener ----------------
 async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes):
+    """
+    Tuned for Snappy Response:
+    - Lowers threshold to catch quiet voices.
+    - Lowers pause time to reply instantly.
+    """
     pcm16 = audioop.ulaw2lin(audio_ulaw, 2)
     rms = audioop.rms(pcm16, 2)
     
-    # High threshold to ignore static
-    SILENCE_THRESHOLD = 2000 
+    # 1. INCREASE SENSITIVITY
+    # Old: 2000 (Misses quiet words)
+    # New: 1000 (Hear everything, relying on Deepgram to filter noise)
+    SILENCE_THRESHOLD = 1000 
 
     if rms > SILENCE_THRESHOLD:
         silence_counter[call_sid] = 0
@@ -122,14 +129,21 @@ async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes
     else:
         silence_counter[call_sid] += 1
 
-    # Wait for 1 second of silence
-    if silence_counter[call_sid] >= 50:
+    # 2. MAKE IT INSTANT
+    # Twilio sends chunks every 20ms.
+    # Old: 50 chunks = 1.0 second wait (Too slow!)
+    # New: 25 chunks = 0.5 second wait (Conversational)
+    PAUSE_LIMIT = 25 
+    
+    if silence_counter[call_sid] >= PAUSE_LIMIT:
+        # Only process if we have a meaningful amount of audio (>0.25s)
         if len(full_sentence_buffer[call_sid]) > 4000: 
             complete_audio = bytes(full_sentence_buffer[call_sid])
             full_sentence_buffer[call_sid].clear()
             silence_counter[call_sid] = 0
             asyncio.create_task(handle_complete_sentence(call_sid, stream_sid, complete_audio))
         else:
+            # Just a click or pop, clear it
             if len(full_sentence_buffer[call_sid]) > 0:
                 full_sentence_buffer[call_sid].clear()
             silence_counter[call_sid] = 0
