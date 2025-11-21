@@ -205,44 +205,41 @@ async def media_ws_endpoint(ws: WebSocket):
 # ---------------- Audio processing pipeline ----------------
 async def handle_audio_chunk(call_sid: str, stream_sid: str, audio_ulaw: bytes):
     """
-    audio_ulaw: raw µ-law bytes (8kHz mono). Convert to PCM for STT or debugging.
-    This is a stubbed pipeline that pretends it recognized speech and replies.
-    Replace the STT stub with a real STT call (Deepgram, OpenAI, etc.).
+    Processes audio.
+    FIX: Now checks volume (RMS) to ensure we don't reply to silence.
     """
-    print(f"[{call_sid}] handling audio chunk, {len(audio_ulaw)} bytes")
-
-    # Convert µ-law to 16-bit PCM
+    # 1. Convert µ-law to PCM so we can calculate volume
     pcm16 = audioop.ulaw2lin(audio_ulaw, 2)
 
-    # Optional: write to temp WAV for debugging
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-            tmp_wav = tf.name
-        # Use pydub to build a wav (frame_rate=8000, sample_width=2)
-        seg = AudioSegment(
-            data=pcm16,
-            sample_width=2,
-            frame_rate=SAMPLE_RATE,
-            channels=1
-        )
-        seg.export(tmp_wav, format="wav")
-        # (You can inspect tmp_wav if needed)
-    except Exception as e:
-        print(f"[{call_sid}] failed writing debug wav: {e}")
+    # --- FIX: SILENCE DETECTION ---
+    # Calculate the Root Mean Square (volume) of the audio chunk.
+    # 16-bit audio ranges from 0 to 32768. 
+    # Silence is usually < 500. Speech is usually > 2000.
+    rms = audioop.rms(pcm16, 2)
+    
+    print(f"[{call_sid}] Volume (RMS): {rms}")
 
-    # --- STT stub ----
-    # In production: send `pcm16` to your ASR provider and get user_text.
-    user_text = "hello"  # placeholder
-    print(f"[{call_sid}] (stub) recognized: {user_text}")
+    # Ideally set this between 1000 and 2000. 
+    # If it ignores your voice, LOWER it. If it replies to silence, RAISE it.
+    SILENCE_THRESHOLD = 1500 
+
+    if rms < SILENCE_THRESHOLD:
+        # It's too quiet, probably just line noise. Ignore it.
+        return
+
+    # --- STT stub (Placeholder) ----
+    # NOTE: This still pretends you said "hello". 
+    # To fix this for real, you need to send `pcm16` to Deepgram or OpenAI Whisper.
+    user_text = "hello" 
 
     # Simple AI reply logic — avoid spamming replies too quickly
     now = time.time()
-    if now - last_ai_reply_time[call_sid] < 1.5:
+    if now - last_ai_reply_time[call_sid] < 2.0:
         print(f"[{call_sid}] skipping reply to avoid overlap")
         return
     last_ai_reply_time[call_sid] = now
 
-    ai_reply = f"I heard you: \"{user_text}\". This is a test reply."
+    ai_reply = f"I heard you. The volume was {rms}."
 
     # send TTS back
     ws = media_ws_map.get(call_sid)
