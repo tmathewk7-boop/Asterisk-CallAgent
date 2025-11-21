@@ -12,3 +12,4 @@ pydub
 gtts==2.3.2
 deepgram-sdk
 jinja2
+SpeechRecognition
