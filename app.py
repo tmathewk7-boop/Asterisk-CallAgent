@@ -122,7 +122,7 @@ async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes
     rms = audioop.rms(pcm16, 2)
     
     # THRESHOLD: Lower = more sensitive. Higher = ignores noise.
-    SILENCE_THRESHOLD = 1200 
+    SILENCE_THRESHOLD = 2500 
 
     if rms > SILENCE_THRESHOLD:
         silence_counter[call_sid] = 0
@@ -213,7 +213,7 @@ def generate_smart_response(user_text):
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text},
             ],
-            model="llama3-8b-8192", # Extremely fast model
+            model="llama-3.1-8b-instant", # Extremely fast model
             temperature=0.6,
             max_tokens=100,
         )
@@ -232,50 +232,34 @@ async def send_fast_tts(ws: WebSocket, stream_sid: str, text: str):
     Hybrid TTS: Tries Edge (Fast). If it fails, uses gTTS (Reliable).
     """
     print(f"Generating TTS: {text}")
-    
+    mp3_data = b""
+
     # 1. Try Edge TTS (Fastest)
     try:
-        # "en-US-GuyNeural" is generally very stable
-        VOICE = "en-US-GuyNeural" 
-        communicate = edge_tts.Communicate(text, VOICE)
-        mp3_data = b""
-        
+        communicate = edge_tts.Communicate(text, "en-US-GuyNeural")
         async for chunk in communicate.stream():
             if chunk["type"] == "audio":
                 mp3_data += chunk["data"]
-
-        if len(mp3_data) == 0:
-            raise Exception("EdgeTTS returned zero bytes.")
-
-        # If we got here, Edge worked! Process it.
-        await process_and_send_audio(ws, stream_sid, mp3_data)
-        return
-
     except Exception as e:
-        print(f"EdgeTTS failed ({e}). Switching to Backup (gTTS)...")
+        print(f"EdgeTTS blocked. Using Backup...")
 
-    # 2. Fallback to gTTS (Slower but Reliable)
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
-            mp3_path = tf.name
+    # 2. Fallback: If Edge failed (empty data), use gTTS
+    if len(mp3_data) == 0:
+        try:
+            loop = asyncio.get_running_loop()
+            # Run gTTS in memory (no file saving = faster)
+            def generate_gtts():
+                fp = io.BytesIO()
+                gTTS(text=text, lang="en").write_to_fp(fp)
+                return fp.getvalue()
             
-        loop = asyncio.get_running_loop()
-        # Run gTTS in background
-        await loop.run_in_executor(None, lambda: gTTS(text=text, lang="en").save(mp3_path))
-        
-        # Read the file back
-        with open(mp3_path, "rb") as f:
-            mp3_data = f.read()
-            
-        # Process and send
-        await process_and_send_audio(ws, stream_sid, mp3_data)
-        
-        # Cleanup
-        os.unlink(mp3_path)
-        
-    except Exception as e:
-        print(f"CRITICAL: Both TTS engines failed. {e}")
+            mp3_data = await loop.run_in_executor(None, generate_gtts)
+        except Exception as e:
+            print(f"CRITICAL: Backup TTS failed. {e}")
+            return
 
+    # 3. Process and Send
+    await process_and_send_audio(ws, stream_sid, mp3_data)
 async def process_and_send_audio(ws: WebSocket, stream_sid: str, mp3_data: bytes):
     """
     Helper function to convert MP3 bytes to µ-law and send to Twilio.
