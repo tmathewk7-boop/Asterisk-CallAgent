@@ -6,87 +6,104 @@ import audioop
 import httpx
 import datetime
 from collections import defaultdict
+from typing import Optional
+from pydantic import BaseModel
 
 # --- IMPORTS ---
 from groq import Groq
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.responses import Response, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 
-# ==========================================
-#       📝 CLIENT CONFIGURATION AREA
-# ==========================================
-# This is where you register your 3 phone numbers.
-# The server will automatically switch personalities based on which number is dialed.
-
-CLIENT_CONFIG = {
-    # CLIENT 1: Example - Dental Clinic
-    "+188254352488": {
-        "name": "Thomas Mathew",
-        "prompt": "You are a receptionist for Thomas Mathew the Lawyer. Be friendly. Try to schedule an appointment.",
-    },
-    
-    # CLIENT 2: Example - Pizza Place
-    "+16475550200": {
-        "name": "Tony's Pizza",
-        "prompt": "You are a pizza order taker. The special today is pepperoni. Keep it short.",
-    },
-
-    # CLIENT 3: Example - Tech Support
-    "+15551234567": {
-        "name": "IT Support",
-        "prompt": "You are a tired IT support agent. Ask if they have tried turning it off and on again.",
-    }
-}
-
-# Fallback (If a number calls that isn't in the list)
-DEFAULT_CLIENT = {
-    "name": "General AI",
-    "prompt": "You are a helpful assistant. Be concise."
-}
-# ==========================================
-
-# ---------- Env Vars ----------
+# ---------- Configuration ----------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 PORT = int(os.getenv("PORT", 8000))
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://your-app.onrender.com")
+SETTINGS_FILE = "user_settings.json"
 
-if GROQ_API_KEY: groq_client = Groq(api_key=GROQ_API_KEY)
-else: groq_client = None
+if GROQ_API_KEY:
+    groq_client = Groq(api_key=GROQ_API_KEY)
+else:
+    groq_client = None
 
 app = FastAPI()
 app.add_middleware(
     CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
 )
 
-# ---------- STATE & DATABASE ----------
+# ---------- DATABASE (In-Memory + File Persistence) ----------
 call_db = {}      
 transcripts = defaultdict(list) 
 media_ws_map = {}
 silence_counter = defaultdict(int)
 full_sentence_buffer = defaultdict(bytearray)
+active_call_config = {} 
 
-# Tracks which client config belongs to which active call
-active_call_sessions = {} 
+# --- PERSISTENT SETTINGS STORAGE ---
+# Structure: { "+13065551234": { "system_prompt": "...", "greeting": "..." } }
+def load_settings():
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r") as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_settings(data):
+    with open(SETTINGS_FILE, "w") as f:
+        json.dump(data, f, indent=2)
+
+# Load on startup
+USER_CONFIGS = load_settings()
+
+# Default if user hasn't customized yet
+DEFAULT_CONFIG = {
+    "system_prompt": "You are a helpful assistant. Be concise.",
+    "greeting": "Hello! I am your AI assistant."
+}
+
+# ---------- API MODELS ----------
+class AgentSettings(BaseModel):
+    phone_number: str
+    system_prompt: str
+    greeting: str
 
 # ---------------- API FOR DASHBOARD ----------------
+
 @app.get("/api/calls/{target_number}")
 async def get_calls_for_client(target_number: str):
     """
-    Your Dashboard .exe calls this.
-    It filters the database and returns ONLY calls made to 'target_number'.
+    Returns calls specifically for the logged-in user's phone number.
     """
     filtered_calls = []
+    # Normalize formatting if needed, strictly matching for now
     for call in call_db.values():
-        # We check the 'system_number' (the number the user dialed)
         if call.get("system_number") == target_number:
             filtered_calls.append(call)
-            
-    # Sort newest first
     filtered_calls.reverse()
     return filtered_calls
+
+@app.get("/api/settings/{target_number}")
+async def get_settings(target_number: str):
+    """
+    Returns the current AI settings for a user.
+    """
+    return USER_CONFIGS.get(target_number, DEFAULT_CONFIG)
+
+@app.post("/api/settings")
+async def update_settings(settings: AgentSettings):
+    """
+    Updates the AI Prompt and Greeting for a specific user.
+    """
+    USER_CONFIGS[settings.phone_number] = {
+        "system_prompt": settings.system_prompt,
+        "greeting": settings.greeting
+    }
+    save_settings(USER_CONFIGS)
+    return {"status": "success", "message": "Settings saved"}
 
 # ---------------- TwiML endpoint ----------------
 @app.post("/twilio/incoming")
@@ -95,36 +112,30 @@ async def twilio_incoming(request: Request):
     
     call_sid = form.get("CallSid")
     caller_number = form.get("From", "Unknown")
+    system_number = form.get("To", "") 
     
-    # 1. IDENTIFY THE CLIENT
-    # "To" is the number the person dialed (Your Twilio Number)
-    dialed_number = form.get("To", "") 
+    # 1. LOAD USER CONFIG
+    # Check if this number has custom settings, otherwise use default
+    config = USER_CONFIGS.get(system_number, DEFAULT_CONFIG)
     
-    # 2. LOAD THE PROFILE
-    if dialed_number in CLIENT_CONFIG:
-        client_profile = CLIENT_CONFIG[dialed_number]
-    else:
-        client_profile = DEFAULT_CLIENT
-    
-    # Save this session so the AI knows who to be
-    active_call_sessions[call_sid] = client_profile
+    # Save config for this specific call session
+    active_call_config[call_sid] = config
 
-    # 3. LOG THE CALL
+    # 2. LOG THE CALL
     city = form.get("FromCity", "")
     location = f"{city}, {form.get('FromState', '')}" if city else "Unknown"
     
     call_db[call_sid] = {
         "sid": call_sid,
         "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
-        "number": caller_number,       # Who called
-        "system_number": dialed_number, # Which of your clients they called
-        "client_name": client_profile["name"],
+        "number": caller_number,
+        "system_number": system_number,
         "location": location,
         "status": "Live",
         "summary": None
     }
     
-    print(f"New Call: {caller_number} -> {client_profile['name']} ({dialed_number})")
+    print(f"New Call: {caller_number} -> {system_number}")
 
     host = PUBLIC_URL
     if host.startswith("https://"): host = host.replace("https://", "wss://")
@@ -157,8 +168,11 @@ async def media_ws_endpoint(ws: WebSocket):
                 stream_sid = data["start"].get("streamSid")
                 media_ws_map[call_sid] = ws
                 
-                # Send welcome
-                await send_deepgram_tts(ws, stream_sid, "Hello! I'm listening.")
+                # GET CUSTOM GREETING
+                config = active_call_config.get(call_sid, DEFAULT_CONFIG)
+                greeting = config.get("greeting", "Hello.")
+                
+                await send_deepgram_tts(ws, stream_sid, greeting)
                 continue
 
             if event == "media":
@@ -178,21 +192,19 @@ async def media_ws_endpoint(ws: WebSocket):
             asyncio.create_task(generate_call_summary(call_sid))
             if call_sid in media_ws_map: del media_ws_map[call_sid]
             if call_sid in full_sentence_buffer: del full_sentence_buffer[call_sid]
-            if call_sid in active_call_sessions: del active_call_sessions[call_sid]
+            if call_sid in active_call_config: del active_call_config[call_sid]
 
 # ---------------- LOGIC ----------------
 async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes):
     pcm16 = audioop.ulaw2lin(audio_ulaw, 2)
     rms = audioop.rms(pcm16, 2)
     
-    # VAD Threshold (Low for sensitivity)
     if rms > 600:
         silence_counter[call_sid] = 0
         full_sentence_buffer[call_sid].extend(audio_ulaw)
     else:
         silence_counter[call_sid] += 1
 
-    # Fast Pause (0.4s)
     if silence_counter[call_sid] >= 20: 
         if len(full_sentence_buffer[call_sid]) > 2000: 
             complete_audio = bytes(full_sentence_buffer[call_sid])
@@ -211,13 +223,11 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
         print(f"[{call_sid}] User: {transcript}")
         transcripts[call_sid].append(f"User: {transcript}")
 
-        # --- MULTI-USER PROMPT SWITCHING ---
-        # 1. Get the profile for this specific call
-        profile = active_call_sessions.get(call_sid, DEFAULT_CLIENT)
-        # 2. Get the custom prompt
-        custom_system_prompt = profile["prompt"]
+        # GET CUSTOM PROMPT
+        config = active_call_config.get(call_sid, DEFAULT_CONFIG)
+        custom_prompt = config.get("system_prompt", "You are a helpful assistant.")
 
-        response_text = await generate_smart_response(transcript, custom_system_prompt)
+        response_text = await generate_smart_response(transcript, custom_prompt)
         transcripts[call_sid].append(f"AI: {response_text}")
         
         ws = media_ws_map.get(call_sid)
@@ -255,13 +265,11 @@ async def transcribe_raw_audio(raw_ulaw):
         return None
     except Exception: return None
 
-# Updated to accept 'system_prompt'
 async def generate_smart_response(user_text, system_prompt):
     if not groq_client: return "Error."
     try:
-        # We append instructions to keep it short
-        full_prompt = f"{system_prompt} Keep your answer to 1 short sentence."
-        
+        # Force conciseness on top of user prompt
+        full_prompt = f"{system_prompt} Keep your answer to 1 short sentence (max 15 words)."
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=[{"role": "system", "content": full_prompt}, {"role": "user", "content": user_text}],
