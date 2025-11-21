@@ -114,7 +114,7 @@ async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes
     rms = audioop.rms(pcm16, 2)
     
     # THRESHOLD: Lower = more sensitive. Higher = ignores noise.
-    SILENCE_THRESHOLD = 500 
+    SILENCE_THRESHOLD = 800 
 
     if rms > SILENCE_THRESHOLD:
         silence_counter[call_sid] = 0
@@ -223,7 +223,7 @@ async def send_fast_tts(ws: WebSocket, stream_sid: str, text: str):
     print(f"Generating Fast TTS: {text}")
     
     # Voice options: 'en-US-AriaNeural' (Female), 'en-US-GuyNeural' (Male)
-    VOICE = "en-US-AriaNeural"
+    VOICE = "en-US-GuyNeural"
     
     try:
         # 1. Generate Audio in Memory (No disk I/O = Faster)
