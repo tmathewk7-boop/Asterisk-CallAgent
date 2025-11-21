@@ -3,9 +3,7 @@ import base64
 import json
 import asyncio
 import audioop
-import requests
-import io
-import wave
+import httpx # pip install httpx
 from collections import defaultdict
 
 # --- IMPORTS ---
@@ -99,58 +97,46 @@ async def media_ws_endpoint(ws: WebSocket):
         if call_sid in media_ws_map: del media_ws_map[call_sid]
         if call_sid in full_sentence_buffer: del full_sentence_buffer[call_sid]
 
-# ---------------- VAD & Listener (RAM OPTIMIZED) ----------------
+# ---------------- VAD & Listener (RAW MODE) ----------------
 async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes):
+    # We only convert to PCM for the volume check (VAD)
+    # We keep the original 'audio_ulaw' for sending to Deepgram (Faster)
     pcm16 = audioop.ulaw2lin(audio_ulaw, 2)
     rms = audioop.rms(pcm16, 2)
     
-    # Sensitivity: 600 is good for phone lines
     SILENCE_THRESHOLD = 600 
 
     if rms > SILENCE_THRESHOLD:
         silence_counter[call_sid] = 0
-        full_sentence_buffer[call_sid].extend(pcm16)
+        # Append RAW UL-AW bytes directly
+        full_sentence_buffer[call_sid].extend(audio_ulaw)
     else:
         silence_counter[call_sid] += 1
 
-    # FIX: Lower pause limit to 0.5s (25 chunks) for snappier response
-    PAUSE_LIMIT = 25
+    # SPEED TWEAK: 20 chunks = 0.4 seconds. 
+    # This makes it interrupt you faster.
+    PAUSE_LIMIT = 20
     
     if silence_counter[call_sid] >= PAUSE_LIMIT:
-        if len(full_sentence_buffer[call_sid]) > 3200:  # >0.2s of audio
-            # COPY audio to memory instantly so we can clear buffer and keep listening
+        # 2000 bytes of ulaw = 0.25s of audio
+        if len(full_sentence_buffer[call_sid]) > 2000: 
             complete_audio = bytes(full_sentence_buffer[call_sid])
             full_sentence_buffer[call_sid].clear()
             silence_counter[call_sid] = 0
             
-            # Fire and forget (run in background)
+            # Run in background
             asyncio.create_task(handle_complete_sentence(call_sid, stream_sid, complete_audio))
         else:
-            # Noise cleanup
             if len(full_sentence_buffer[call_sid]) > 0:
                 full_sentence_buffer[call_sid].clear()
             silence_counter[call_sid] = 0
 
-async def handle_complete_sentence(call_sid: str, stream_sid: str, pcm_bytes: bytes):
-    """
-    NO DISK I/O. NO PYDUB. PURE RAM.
-    """
+async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: bytes):
     print(f"[{call_sid}] Processing...")
 
     try:
-        loop = asyncio.get_running_loop()
-        
-        # 1. Convert raw PCM to WAV in Memory (Fastest way)
-        wav_buffer = io.BytesIO()
-        with wave.open(wav_buffer, 'wb') as wav_file:
-            wav_file.setnchannels(1)
-            wav_file.setsampwidth(2) # 16-bit
-            wav_file.setframerate(8000) # Phone standard
-            wav_file.writeframes(pcm_bytes)
-        wav_buffer.seek(0)
-
-        # 2. Transcribe with Deepgram (Direct Byte Stream)
-        transcript = await loop.run_in_executor(None, lambda: transcribe_stream(wav_buffer))
+        # 1. Transcribe (Direct Raw Send)
+        transcript = await transcribe_raw_audio(raw_ulaw)
         
         if not transcript:
             print(f"[{call_sid}] No speech detected.")
@@ -158,10 +144,10 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, pcm_bytes: by
 
         print(f"[{call_sid}] User said: '{transcript}'")
         
-        # 3. Brain (Groq)
-        response_text = generate_smart_response(transcript)
+        # 2. Brain (Groq)
+        response_text = await generate_smart_response(transcript)
         
-        # 4. Speak (Deepgram Aura)
+        # 3. Speak (Deepgram Aura)
         ws = media_ws_map.get(call_sid)
         if ws:
             await send_deepgram_tts(ws, stream_sid, response_text)
@@ -169,19 +155,23 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, pcm_bytes: by
     except Exception as e:
         print(f"Processing Error: {e}")
 
-def transcribe_stream(audio_buffer):
+async def transcribe_raw_audio(raw_ulaw):
     if not DEEPGRAM_API_KEY: return None
     try:
-        # Note: Nova-2 is robust enough for 8000Hz phone audio
-        url = "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true"
+        # Nova-2 supports raw mulaw (Twilio format) directly!
+        # This saves us the time of converting to WAV.
+        url = "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&encoding=mulaw&sample_rate=8000"
+        
         headers = {
             "Authorization": f"Token {DEEPGRAM_API_KEY}",
-            "Content-Type": "audio/wav"
+            "Content-Type": "audio/basic" # Standard for raw audio
         }
-        response = requests.post(url, headers=headers, data=audio_buffer)
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, content=raw_ulaw)
+            
         data = response.json()
         
-        # Safe access
         if 'results' in data and 'channels' in data['results']:
              return data['results']['channels'][0]['alternatives'][0]['transcript']
         return None
@@ -189,27 +179,30 @@ def transcribe_stream(audio_buffer):
         print(f"Transcribe Error: {e}")
         return None
 
-# ---------------- The Brain (Concise) ----------------
-def generate_smart_response(user_text):
+# ---------------- The Brain (Async) ----------------
+async def generate_smart_response(user_text):
     if not groq_client: return "No brain found."
     try:
         print(f"Asking Llama: {user_text}")
-        system_prompt = "You are a phone assistant. Be extremely concise. 1 short sentence only."
+        system_prompt = "You are a conversational phone assistant. Be extremely concise. Answer in 1 sentence (max 15 words)."
         
-        completion = groq_client.chat.completions.create(
+        # Run Groq in thread (it's sync) or use AsyncGroq if available. 
+        # For now, simple executor is fine.
+        loop = asyncio.get_running_loop()
+        completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": user_text},
             ],
             model="llama-3.1-8b-instant",
             max_tokens=50,
-        )
+        ))
         return completion.choices[0].message.content.strip()
     except Exception as e:
         print(f"Groq Error: {e}")
         return "I didn't catch that."
 
-# ---------------- DEEPGRAM TTS (Streaming) ----------------
+# ---------------- DEEPGRAM TTS (Streaming + Async) ----------------
 async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str):
     if not DEEPGRAM_API_KEY: return
     print(f"Deepgram Streaming: {text}")
@@ -219,16 +212,20 @@ async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str):
     payload = {"text": text}
 
     try:
-        loop = asyncio.get_running_loop()
-        response = await loop.run_in_executor(None, lambda: requests.post(url, headers=headers, json=payload, stream=True))
-
-        for chunk in response.iter_content(chunk_size=1600):
-            if chunk:
-                payload = base64.b64encode(chunk).decode("ascii")
-                await ws.send_json({
-                    "event": "media", "streamSid": stream_sid, "media": {"payload": payload}
-                })
-                await asyncio.sleep(0.002) # Tiny throttle
+        # Use httpx for async streaming
+        async with httpx.AsyncClient() as client:
+            async with client.stream("POST", url, headers=headers, json=payload) as response:
+                async for chunk in response.aiter_bytes():
+                    if chunk:
+                        payload = base64.b64encode(chunk).decode("ascii")
+                        await ws.send_json({
+                            "event": "media", 
+                            "streamSid": stream_sid, 
+                            "media": {"payload": payload}
+                        })
+                        # Tiny sleep is often not needed with real async streaming
+                        # But we keep a micro-sleep to be safe
+                        await asyncio.sleep(0.001)
 
     except Exception as e:
         print(f"TTS Error: {e}")
