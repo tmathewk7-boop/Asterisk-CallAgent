@@ -20,6 +20,7 @@ import struct
 from pathlib import Path
 from collections import defaultdict
 from functools import partial
+import audioop
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import PlainTextResponse, HTMLResponse, Response
