@@ -1,63 +1,37 @@
-# main.py
-"""
-Working Twilio Media Streams example (FastAPI).
-- Accepts incoming Twilio call webhook at /twilio/incoming (returns TwiML that opens a media stream to /media-ws)
-- Handles Twilio media websocket messages at /media-ws
-- Buffers incoming audio (µ-law 8kHz) and processes ~1s chunks
-- Produces a text reply (stubbed) and streams it back to the call as µ-law frames
-Notes:
-- Do NOT call Twilio REST to change TwiML mid-call (that will tear down streaming).
-- Make sure PUBLIC_URL is reachable by Twilio and uses wss/http/https accordingly.
-"""
-import wave
-import functools
 import os
 import base64
-import asyncio
 import json
 import tempfile
-import time
-import math
-import struct
+import asyncio
+import audioop
+import datetime
+import io
 from pathlib import Path
 from collections import defaultdict
-from functools import partial
-import audioop
+from groq import Groq
+
+# --- NEW IMPORTS ---
+import edge_tts
+import speech_recognition as sr
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import PlainTextResponse, HTMLResponse, Response
+from fastapi.responses import Response, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
-
 from pydub import AudioSegment
-from gtts import gTTS
-import speech_recognition as sr
-import datetime
-# Initialize the free recognizer
-recognizer = sr.Recognizer()
-
-# Tracks the audio for the current sentence
-full_sentence_buffer = defaultdict(bytearray) 
-# Tracks silence duration
-silence_counter = defaultdict(int)
 
 # ---------- Configuration ----------
-TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")  # optional, not used to change call midstream
-TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "https://your-app.onrender.com")  # <-- set this in Render
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+groq_client = Groq(api_key=GROQ_API_KEY)
 PORT = int(os.getenv("PORT", 8000))
-SAMPLE_RATE = 8000  # Twilio stream sample rate
-# -----------------------------------
+PUBLIC_URL = os.getenv("PUBLIC_URL", "https://your-app.onrender.com")
+SAMPLE_RATE = 8000 
 
+# Setup Folders
 STATIC_DIR = Path("./static")
 TTS_DIR = STATIC_DIR / "tts"
 TTS_DIR.mkdir(parents=True, exist_ok=True)
-
-# Prepare a welcome file (will be created if missing)
-welcome_path = TTS_DIR / "welcome.mp3"
-if not welcome_path.exists():
-    gTTS("Connecting you to the AI assistant.", lang="en").save(str(welcome_path))
 
 app = FastAPI()
 app.add_middleware(
@@ -66,92 +40,29 @@ app.add_middleware(
 app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
 # State
-call_audio_buffer = defaultdict(bytearray)   # incoming µ-law bytes per callSid
-media_ws_map = {}                            # callSid -> websocket
-last_ai_reply_time = defaultdict(lambda: 0.0)
-
-# ---------------- µ-law helper functions ----------------
-# Standard µ-law encoding/decoding (8-bit µ-law <-> signed 16-bit PCM)
-BIAS = 0x84
-CLIP = 32635
-
-def ulaw2lin(u_val):
-    """Convert a single 8-bit mu-law value to 16-bit signed PCM."""
-    u_val = ~u_val & 0xFF
-    sign = (u_val & 0x80)
-    exponent = (u_val >> 4) & 0x07
-    mantissa = u_val & 0x0F
-    t = ((mantissa << 3) + 0x84) << exponent
-    sample = t - 0x84
-    if sign != 0:
-        return -sample
-    else:
-        return sample
-
-def lin2ulaw(sample):
-    """Convert a single 16-bit PCM sample to 8-bit µ-law."""
-    # Clamp
-    if sample > CLIP:
-        sample = CLIP
-    if sample < -CLIP:
-        sample = -CLIP
-
-    sign = 0
-    if sample < 0:
-        sample = -sample
-        sign = 0x80
-    sample = sample + BIAS
-    exponent = 7
-    mask = 0x4000
-    for i in range(7):
-        if sample & mask:
-            exponent = i
-            break
-        mask >>= 1
-    mantissa = (sample >> (exponent + 3)) & 0x0F
-    u_val = ~(sign | (exponent << 4) | mantissa) & 0xFF
-    return u_val
-
-def ulaw_bytes_to_pcm16_bytes(ulaw_bytes: bytes) -> bytes:
-    """Convert bytes of µ-law to bytes of 16-bit LE PCM."""
-    out = bytearray()
-    for b in ulaw_bytes:
-        s = ulaw2lin(b)
-        out += struct.pack("<h", int(s))
-    return bytes(out)
-
-def pcm16_bytes_to_ulaw_bytes(pcm16_bytes: bytes) -> bytes:
-    """Convert 16-bit LE PCM bytes to µ-law bytes."""
-    samples = struct.unpack("<{}h".format(len(pcm16_bytes)//2), pcm16_bytes)
-    return bytes([lin2ulaw(int(s)) for s in samples])
-
-# ---------------- End µ-law helpers ----------------
+call_audio_buffer = defaultdict(bytearray)
+media_ws_map = {}
+silence_counter = defaultdict(int)
+full_sentence_buffer = defaultdict(bytearray)
 
 # ---------------- TwiML endpoint ----------------
 @app.post("/twilio/incoming")
 async def twilio_incoming(request: Request):
     form = await request.form()
-    call_sid = form.get("CallSid")
-    print(f"Incoming call CallSid: {call_sid}")
-
-    # FIX 1: Ensure the URL uses wss:// (Twilio requires wss for media streams)
     host = PUBLIC_URL
+    # Ensure wss:// for websocket
     if host.startswith("https://"):
         host = host.replace("https://", "wss://")
     elif host.startswith("http://"):
         host = host.replace("http://", "ws://")
-    
     stream_url = f"{host}/media-ws"
-
-    # FIX 2: Use <Connect><Stream> for bidirectional (conversational) audio.
-    # <Start> is for background listening (forking); <Connect> is for talking bots.
+    
     twiml = f"""<?xml version="1.0" encoding="UTF-8"?>
 <Response>
     <Connect>
         <Stream url="{stream_url}" />
     </Connect>
 </Response>"""
-
     return Response(content=twiml, media_type="application/xml")
 
 # ---------------- Media WebSocket ----------------
@@ -170,35 +81,21 @@ async def media_ws_endpoint(ws: WebSocket):
 
             if event == "start":
                 call_sid = data["start"].get("callSid")
-                stream_sid = data["start"].get("streamSid", None)
+                stream_sid = data["start"].get("streamSid")
                 media_ws_map[call_sid] = ws
-                print(f"[{call_sid}] stream START (streamSid={stream_sid})")
-                # Immediately stream the welcome message back (as µ-law)
-                await send_text_tts_over_ws(ws, stream_sid, "Connecting you to the AI assistant. Say something and I'll reply.")
+                print(f"[{call_sid}] Stream started")
+                # Send welcome using the FAST TTS
+                await send_fast_tts(ws, stream_sid, "Hello! I am online and ready.")
                 continue
 
             if event == "media":
-                # Twilio sends base64 encoded payload of µ-law bytes (one byte per sample at 8kHz)
                 payload_b64 = data["media"]["payload"]
                 chunk = base64.b64decode(payload_b64)
-                if call_sid is None:
-                    # if no call_sid (rare), try to find inside start object or ignore
-                    print("Received media before start? ignoring")
-                    continue
-
-                # Append to buffer for that call
-                call_audio_buffer[call_sid].extend(chunk)
-
-                # If we've accumulated ~1 second (8000 samples => 8000 bytes) then process
-                if len(call_audio_buffer[call_sid]) >= 8000:
-                    audio_ulaw = bytes(call_audio_buffer[call_sid])
-                    call_audio_buffer[call_sid].clear()
-                    # spawn background processing (won't block websocket)
-                    asyncio.create_task(handle_audio_chunk(call_sid, stream_sid, audio_ulaw))
+                if call_sid:
+                    await process_audio_stream(call_sid, stream_sid, chunk)
                 continue
 
             if event == "stop":
-                print(f"[{call_sid}] stream STOP")
                 break
 
     except WebSocketDisconnect:
@@ -206,196 +103,167 @@ async def media_ws_endpoint(ws: WebSocket):
     except Exception as e:
         print("Media WS error:", e)
     finally:
-        if call_sid and call_sid in media_ws_map:
-            del media_ws_map[call_sid]
-        if call_sid and call_sid in call_audio_buffer:
-            del call_audio_buffer[call_sid]
-        print(f"[{call_sid}] cleaned up")
+        if call_sid in media_ws_map: del media_ws_map[call_sid]
+        if call_sid in call_audio_buffer: del call_audio_buffer[call_sid]
+        if call_sid in full_sentence_buffer: del full_sentence_buffer[call_sid]
 
-# ---------------- Audio processing pipeline ----------------
-async def handle_audio_chunk(call_sid: str, stream_sid: str, audio_ulaw: bytes):
-    """
-    Robust Processing:
-    1. Boosts volume so Google can hear you.
-    2. Upsamples to 16kHz for better accuracy.
-    3. SPEAKS BACK errors instead of staying silent.
-    """
-    try:
-        # 1. Decode and check for silence
-        pcm16 = audioop.ulaw2lin(audio_ulaw, 2)
-        rms = audioop.rms(pcm16, 2)
+# ---------------- VAD & Listener ----------------
+async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes):
+    """Decodes audio, checks for silence, and triggers processing."""
+    pcm16 = audioop.ulaw2lin(audio_ulaw, 2)
+    rms = audioop.rms(pcm16, 2)
+    
+    # THRESHOLD: Lower = more sensitive. Higher = ignores noise.
+    SILENCE_THRESHOLD = 500 
+
+    if rms > SILENCE_THRESHOLD:
+        silence_counter[call_sid] = 0
+        full_sentence_buffer[call_sid].extend(pcm16)
+    else:
+        silence_counter[call_sid] += 1
+
+    # If we have audio and ~0.5s (2 chunks) of silence, process it
+    if silence_counter[call_sid] >= 2 and len(full_sentence_buffer[call_sid]) > 0:
+        complete_audio = bytes(full_sentence_buffer[call_sid])
+        full_sentence_buffer[call_sid].clear()
+        silence_counter[call_sid] = 0
         
-        SILENCE_THRESHOLD = 500 
+        # Run in background to avoid blocking websocket
+        asyncio.create_task(handle_complete_sentence(call_sid, stream_sid, complete_audio))
 
-        if rms > SILENCE_THRESHOLD:
-            silence_counter[call_sid] = 0
-            full_sentence_buffer[call_sid].extend(pcm16)
-            # print(f"[{call_sid}] ... speaking (Vol: {rms})")
+async def handle_complete_sentence(call_sid: str, stream_sid: str, pcm_bytes: bytes):
+    print(f"[{call_sid}] Processing speech...")
+    
+    with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
+        wav_path = tf.name
+
+    try:
+        # 1. Normalize & Convert to WAV for Google (Fixes "Silence" issue)
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, lambda: save_optimized_wav(pcm_bytes, wav_path))
+
+        # 2. Speech to Text (Google Free)
+        transcript = await loop.run_in_executor(None, lambda: transcribe_audio(wav_path))
+        
+        if not transcript:
+            print(f"[{call_sid}] Google detected no speech.")
             return
-        else:
-            silence_counter[call_sid] += 1
 
-        # 2. Process if silence persists for ~1 second
-        if silence_counter[call_sid] >= 3 and len(full_sentence_buffer[call_sid]) > 0:
-            print(f"[{call_sid}] Processing sentence...")
-            
-            complete_audio = bytes(full_sentence_buffer[call_sid])
-            full_sentence_buffer[call_sid].clear()
-            silence_counter[call_sid] = 0
+        print(f"[{call_sid}] User said: '{transcript}'")
 
-            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tf:
-                wav_path = tf.name
-
-            try:
-                # --- FIX 1: PRE-PROCESS AUDIO (Boost Volume + Upsample) ---
-                # Load raw PCM into Pydub
-                seg = AudioSegment(
-                    data=complete_audio, 
-                    sample_width=2, 
-                    frame_rate=SAMPLE_RATE, # 8000 incoming
-                    channels=1
-                )
-                # Normalize (Boost volume to max) - helps Google hear you
-                seg = seg.normalize()
-                # Upsample to 16kHz - Google prefers this
-                seg = seg.set_frame_rate(16000)
-                
-                # Export as clean WAV for Google
-                seg.export(wav_path, format="wav")
-                
-                # 3. Send to Google STT
-                print(f"[{call_sid}] Sending to Google...")
-                loop = asyncio.get_running_loop()
-                
-                def recognize_speech():
-                    r = sr.Recognizer()
-                    # Adjust for ambient noise helps if there's static
-                    with sr.AudioFile(wav_path) as source:
-                        # r.adjust_for_ambient_noise(source, duration=0.5) # Optional if static is bad
-                        audio_data = r.record(source)
-                        return r.recognize_google(audio_data)
-
-                transcript = await loop.run_in_executor(None, recognize_speech)
-                print(f"[{call_sid}] You said: '{transcript}'")
-
-                # 4. Brain Logic
-                text = transcript.lower()
-                response_text = f"You said: {text}" # Default fallback
-
-                if "hello" in text or "hi" in text:
-                    response_text = "Hello! The audio is working perfectly now."
-                elif "time" in text:
-                    now = datetime.datetime.now().strftime("%I:%M %p")
-                    response_text = f"It is currently {now}."
-                elif "weather" in text:
-                    response_text = "I cannot check the weather, but I hope it is nice."
-
-                # Speak valid response
-                ws = media_ws_map.get(call_sid)
-                if ws:
-                    await send_text_tts_over_ws(ws, stream_sid, response_text)
-
-            except sr.UnknownValueError:
-                # --- FIX 2: SPEAK THE ERROR ---
-                print(f"[{call_sid}] Google couldn't understand.")
-                ws = media_ws_map.get(call_sid)
-                if ws:
-                    # Tell the user we couldn't hear them
-                    await send_text_tts_over_ws(ws, stream_sid, "I heard sound, but I could not understand the words.")
-            
-            except sr.RequestError:
-                print(f"[{call_sid}] Google Connection Error.")
-                ws = media_ws_map.get(call_sid)
-                if ws:
-                    await send_text_tts_over_ws(ws, stream_sid, "I am having trouble connecting to the internet.")
-            
-            finally:
-                try:
-                    os.unlink(wav_path)
-                except:
-                    pass
+        # 3. THE SMART BRAIN (New Logic)
+        response_text = generate_smart_response(transcript)
+        
+        # 4. FAST SPEAK BACK (Edge TTS)
+        ws = media_ws_map.get(call_sid)
+        if ws:
+            await send_fast_tts(ws, stream_sid, response_text)
 
     except Exception as e:
-        print(f"[{call_sid}] Critical Error: {e}")
+        print(f"Processing Error: {e}")
+    finally:
+        try: os.unlink(wav_path)
+        except: pass
 
-# ---------------- TTS and streaming back as µ-law ----------------
-async def send_text_tts_over_ws(ws: WebSocket, stream_sid: str, text: str):
-    """
-    Final Optimized Sender:
-    1. Generates in background (No server freeze).
-    2. Filters audio (No static).
-    3. Sends LARGE chunks (No cutting out).
-    """
-    print(f"Generating TTS: {text}")
-    with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tf:
-        mp3_path = tf.name
+def save_optimized_wav(pcm_bytes, path):
+    # Normalize volume and upsample to 16kHz so Google hears clearly
+    audio = AudioSegment(data=pcm_bytes, sample_width=2, frame_rate=8000, channels=1)
+    audio = audio.normalize()
+    audio = audio.set_frame_rate(16000)
+    audio.export(path, format="wav")
 
+def transcribe_audio(path):
+    r = sr.Recognizer()
+    with sr.AudioFile(path) as source:
+        audio = r.record(source)
+        try:
+            return r.recognize_google(audio)
+        except sr.UnknownValueError:
+            return None
+        except sr.RequestError:
+            return None
+
+# ---------------- The Smart Brain ----------------
+def generate_smart_response(user_text):
+    """
+    Uses Groq (Llama 3) for extremely fast inference.
+    """
     try:
-        # 1. Generate in background thread (Prevents lag)
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            None, 
-            lambda: gTTS(text=text, lang="en").save(mp3_path)
+        print(f"Asking Llama 3 (Groq): {user_text}")
+        
+        system_prompt = """
+        You are a helpful, witty, and concise phone assistant. 
+        Your replies are converted to audio, so do not use special characters (*, #, -).
+        Keep answers short (1-2 sentences max) and conversational.
+        """
+        
+        chat_completion = groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": user_text},
+            ],
+            model="llama3-8b-8192", # Extremely fast model
+            temperature=0.6,
+            max_tokens=100,
         )
-
-        # 2. Process Audio
-        audio = AudioSegment.from_file(mp3_path)
         
-        # Filter high freq static
-        audio = audio.low_pass_filter(3000) 
-        # Reduce volume to prevent clipping
-        audio = audio - 14 
-        
-        # Convert to PCM 16-bit @8kHz mono
-        audio = audio.set_frame_rate(SAMPLE_RATE).set_channels(1).set_sample_width(2)
-        pcm16 = audio.raw_data
-        ulaw_bytes = audioop.lin2ulaw(pcm16, 2)
+        ai_text = chat_completion.choices[0].message.content.strip()
+        print(f"Llama replied: {ai_text}")
+        return ai_text
 
-        # 3. Stream to Twilio
-        # FIX: Send LARGER chunks (1600 bytes = 0.2s of audio)
-        # Previously 160 bytes caused network congestion ("cutting out").
+    except Exception as e:
+        print(f"Groq Error: {e}")
+        return "I'm having a brain freeze, could you ask that again?"
+
+# ---------------- FAST TTS (Edge-TTS) ----------------
+async def send_fast_tts(ws: WebSocket, stream_sid: str, text: str):
+    """
+    Uses Edge-TTS (Microsoft) which is INSTANT compared to gTTS.
+    """
+    print(f"Generating Fast TTS: {text}")
+    
+    # Voice options: 'en-US-AriaNeural' (Female), 'en-US-GuyNeural' (Male)
+    VOICE = "en-US-AriaNeural"
+    
+    try:
+        # 1. Generate Audio in Memory (No disk I/O = Faster)
+        communicate = edge_tts.Communicate(text, VOICE)
+        
+        mp3_data = b""
+        async for chunk in communicate.stream():
+            if chunk["type"] == "audio":
+                mp3_data += chunk["data"]
+
+        # 2. Convert MP3 -> PCM -> u-law
+        loop = asyncio.get_running_loop()
+        ulaw_bytes = await loop.run_in_executor(None, lambda: convert_mp3_to_ulaw(mp3_data))
+
+        # 3. Stream to Twilio (Large chunks for smoothness)
         chunk_size = 1600 
-        
         for i in range(0, len(ulaw_bytes), chunk_size):
             chunk = ulaw_bytes[i:i + chunk_size]
             payload = base64.b64encode(chunk).decode("ascii")
             
-            msg = {
-                "event": "media",
-                "streamSid": stream_sid,
-                "media": {"payload": payload}
-            }
-            await ws.send_json(msg)
-            
-            # Remove sleep entirely. 
-            # We trust Twilio's jitter buffer to handle 0.2s chunks smoothly.
-            # This ensures the audio arrives as fast as possible.
-
-        # Mark event
-        try:
             await ws.send_json({
-                "event": "mark",
-                "streamSid": stream_sid,
-                "mark": {"name": "tts_done"}
+                "event": "media", 
+                "streamSid": stream_sid, 
+                "media": {"payload": payload}
             })
-        except Exception:
-            pass
 
     except Exception as e:
-        print("TTS error:", e)
-    finally:
-        try:
-            if os.path.exists(mp3_path):
-                os.unlink(mp3_path)
-        except Exception:
-            pass
+        print(f"TTS Error: {e}")
 
-# ---------------- Health ----------------
-@app.get("/")
-async def index():
-    return HTMLResponse("<h3>Voice Engine Online</h3>")
+def convert_mp3_to_ulaw(mp3_data):
+    # Load from memory
+    audio = AudioSegment.from_file(io.BytesIO(mp3_data), format="mp3")
+    
+    # Filter high freq noise & Format for Phone
+    audio = audio.low_pass_filter(3000)
+    audio = audio.set_frame_rate(8000).set_channels(1).set_sample_width(2)
+    
+    # Convert to u-law
+    return audioop.lin2ulaw(audio.raw_data, 2)
 
-# ---------------- Run ----------------
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=PORT, log_level="info")
+    uvicorn.run(app, host="0.0.0.0", port=PORT)
 
