@@ -494,7 +494,7 @@ async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str, call_sid:
     except Exception: 
         pass
 
-    async def extract_client_name(transcript: str, call_sid: str):
+async def extract_client_name(transcript: str, call_sid: str):
     """Uses Groq's low-latency API to extract the caller's name from a transcript segment."""
     if not groq_client or not transcript: return
 
