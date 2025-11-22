@@ -292,7 +292,10 @@ async def media_ws_endpoint(ws: WebSocket):
                 # Use Custom Greeting
                 config = active_call_config.get(call_sid, DEFAULT_CONFIG)
                 greeting = config.get("greeting", "Hello.")
-                await send_deepgram_tts(ws, stream_sid, greeting)
+                
+                # --- FIX: Pass call_sid for logging/optional interruption handling ---
+                await send_deepgram_tts(ws, stream_sid, greeting, call_sid)
+                
                 continue
 
             if event == "media":
@@ -467,7 +470,8 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
         return "I apologize, I experienced a brief issue. Could you repeat that?"
 
 
-async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str, call_sid: str):
+# Updated send_deepgram_tts signature
+async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str, call_sid: Optional[str] = None):
     if not DEEPGRAM_API_KEY: return
     url = "https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000&container=none"
     headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "application/json"}
@@ -482,10 +486,11 @@ async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str, call_sid:
                         await ws.send_json({"event": "media", "streamSid": stream_sid, "media": {"payload": payload}})
                         await asyncio.sleep(0.001)
     except asyncio.CancelledError:
-        print(f"[{call_sid}] TTS stream CANCELLED by user interrupt.")
-        raise
+        if call_sid:
+            print(f"[{call_sid}] TTS stream CANCELLED by user interrupt.")
+        raise 
     except Exception: 
         pass
-
+        
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
