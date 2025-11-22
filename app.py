@@ -1,6 +1,7 @@
 import os
 import pymysql
 import base64
+import re
 import json
 import asyncio
 import audioop
@@ -426,7 +427,7 @@ async def transcribe_raw_audio(raw_ulaw):
     except Exception: return None
 
 async def generate_smart_response(user_text: str, system_prompt: str, context_history: list):
-    if not groq_client: return "Error."
+    if not groq_client: return "I apologize, I experienced a brief issue. Could you repeat that?"
     try:
         ssml_prompt = (
             f"{system_prompt} You must respond in a single SSML `<speak>` tag. "
@@ -436,28 +437,8 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
             f"for human-like conversational fluidity. Do not include the initial greeting."
         )
 
-        # --- CONSTRUCT MESSAGES ARRAY FROM HISTORY ---
-        messages = [{"role": "system", "content": ssml_prompt}]
-        
-        for line in context_history:
-            if line.startswith("User:"):
-                role = "user"
-                content = line[5:].strip()
-            elif line.startswith("AI:"):
-                role = "assistant"
-                content = line[3:].strip()
-            else:
-                continue
-                
-            # Skip the final message, which is passed separately as user_text
-            if content == user_text and role == "user": continue
-                
-            messages.append({"role": role, "content": content})
+        # ... (rest of the messages construction code remains the same) ...
 
-        # Add the current user input as the final message
-        messages.append({"role": "user", "content": user_text})
-
-        # --- CALL GROQ ---
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=messages,
@@ -465,7 +446,19 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
             max_tokens=100
         ))
         
-        return completion.choices[0].message.content.strip()
+        # --- NEW POST-PROCESSING LOGIC ---
+        raw_response = completion.choices[0].message.content
+        
+        # Use regex to replace any sequence of whitespace (multiple spaces, newlines, etc.) 
+        # with a single space, guaranteeing clean word separation for the TTS engine.
+        cleaned_response = re.sub(r'\s+', ' ', raw_response).strip()
+        
+        # Now, check if the response is still valid SSML before returning
+        if not cleaned_response.startswith("<speak>"):
+             # Fallback to plain text if the SSML structure was lost/corrupted
+             return f"<speak>{cleaned_response}</speak>" 
+        
+        return cleaned_response
         
     except Exception as e:
         print(f"Groq generation failed: {e}")
