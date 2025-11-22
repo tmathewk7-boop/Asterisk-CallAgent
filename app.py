@@ -325,8 +325,9 @@ async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes
     pcm16 = audioop.ulaw2lin(audio_ulaw, 2)
     rms = audioop.rms(pcm16, 2)
     
-    # --- INTERRUPTION CHECK ---
-    if rms > 300: # User voice is loud enough to be an active speaker
+    # --- INTERRUPT/VOICE CHECK ---
+    # Lowered from 300 to 200 for maximum sensitivity.
+    if rms > 200: # User voice is loud enough to be an active speaker
         silence_counter[call_sid] = 0
         
         # Check if the AI is currently speaking (task is in the map)
@@ -343,18 +344,18 @@ async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes
         full_sentence_buffer[call_sid].extend(audio_ulaw)
         
     else:
-        # If the AI was just interrupted, or if no one is talking
+        # If the user is silent
         silence_counter[call_sid] += 1
 
-    # --- END-OF-SENTENCE VAD LOGIC ---
-    if silence_counter[call_sid] >= 40: 
+    # --- END-OF-SENTENCE VAD LOGIC (40 chunks = 800ms) ---
+    if silence_counter[call_sid] >= 40: # 40 chunks = 800ms of silence
         if len(full_sentence_buffer[call_sid]) > 2000: 
             complete_audio = bytes(full_sentence_buffer[call_sid])
             full_sentence_buffer[call_sid].clear()
             silence_counter[call_sid] = 0
             
             # Trigger the LLM response after the user finishes speaking
-            asyncio.create_task(_sentence(call_sid, stream_sid, complete_audio))
+            asyncio.create_task(handle_complete_sentence(call_sid, stream_sid, complete_audio))
         else:
             if len(full_sentence_buffer[call_sid]) > 0: full_sentence_buffer[call_sid].clear()
             silence_counter[call_sid] = 0
