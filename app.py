@@ -344,7 +344,7 @@ async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes
         silence_counter[call_sid] += 1
 
     # --- END-OF-SENTENCE VAD LOGIC ---
-    if silence_counter[call_sid] >= 20: # 20 chunks = 400ms of silence
+    if silence_counter[call_sid] >= 30: 
         if len(full_sentence_buffer[call_sid]) > 2000: 
             complete_audio = bytes(full_sentence_buffer[call_sid])
             full_sentence_buffer[call_sid].clear()
