@@ -521,16 +521,20 @@ async def extract_client_name(transcript: str, call_sid: str):
 
     try:
         loop = asyncio.get_running_loop()
-        # --- FIX: STRICT, NO-APOLOGY EXTRACTION PROMPT ---
+        # Zero-shot prompt to extract the name
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "Analyze the transcript. Extract ONLY the caller's full name (First and Last). If no name is explicitly given, return ONLY the single, exact word 'None' (case-sensitive). Do not include any other text, apologies, or explanations."}, 
+                {"role": "system", "content": "Analyze the following transcript. Extract ONLY the caller's full name (First and Last). If no name is explicitly given, return ONLY the single, exact word 'None' (case-sensitive). Do not include any other text, apologies, or explanations."}, 
                 {"role": "user", "content": transcript}
             ],
             model="llama-3.1-8b-instant", max_tokens=15
         ))
         
         extracted_name = completion.choices[0].message.content.strip()
+
+        # --- DEBUG POINT 1: Show Raw LLM Output ---
+        print(f"[{call_sid}] DEBUG: Raw LLM Name Output: '{extracted_name}'")
+        # ------------------------------------------
 
         # Aggressively clean the extracted name
         cleaned_name = extracted_name.replace('"', '').replace('.', '').strip()
@@ -540,8 +544,14 @@ async def extract_client_name(transcript: str, call_sid: str):
         if cleaned_name.lower() != "none" and len(cleaned_name) > 3:
             if call_sid in call_db:
                 call_db[call_sid]["client_name"] = cleaned_name
-                print(f"[{call_sid}] Name Extracted and Updated: {cleaned_name}")
                 
+                # --- DEBUG POINT 2: Show Successful Save ---
+                print(f"[{call_sid}] SUCCESS: Name Updated in DB Memory to '{cleaned_name}'")
+                # ------------------------------------------
+                
+        else:
+            print(f"[{call_sid}] FAIL: Name rejected. Cleaned name: '{cleaned_name}'.")
+
     except Exception as e:
         print(f"Error during name extraction: {e}")
         
