@@ -326,7 +326,7 @@ async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes
     rms = audioop.rms(pcm16, 2)
     
     # --- INTERRUPTION CHECK ---
-    if rms > 600: # User voice is loud enough to be an active speaker
+    if rms > 300: # User voice is loud enough to be an active speaker
         silence_counter[call_sid] = 0
         
         # Check if the AI is currently speaking (task is in the map)
@@ -347,7 +347,7 @@ async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes
         silence_counter[call_sid] += 1
 
     # --- END-OF-SENTENCE VAD LOGIC ---
-    if silence_counter[call_sid] >= 30: 
+    if silence_counter[call_sid] >= 40: 
         if len(full_sentence_buffer[call_sid]) > 2000: 
             complete_audio = bytes(full_sentence_buffer[call_sid])
             full_sentence_buffer[call_sid].clear()
@@ -372,16 +372,12 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
         
         config = active_call_config.get(call_sid, DEFAULT_CONFIG)
         custom_prompt = config.get("system_prompt", "You are a helpful assistant.")
-        
-        # --- FIX: Retrieve the stored Caller ID ---
         fixed_caller_id = config.get("caller_id", "N/A") 
 
         # Run name extraction in background
         asyncio.create_task(extract_client_name(transcript, call_sid))
         
-        # --- FIX: Pass the required fixed_caller_id argument ---
         response_text = await generate_smart_response(transcript, custom_prompt, context_history, fixed_caller_id)
-        
         transcripts[call_sid].append(f"AI: {response_text}")
         
         ws = media_ws_map.get(call_sid)
@@ -389,13 +385,20 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
             tts_task = asyncio.create_task(send_deepgram_tts(ws, stream_sid, response_text, call_sid))
             tts_task_map[call_sid] = tts_task
             
-            await tts_task
+            try:
+                await tts_task # Wait for it to finish (or be successfully cancelled)
+            except asyncio.CancelledError:
+                # --- CRITICAL FIX ---
+                # Task was successfully intercepted by the user's voice; treat as normal
+                print(f"[{call_sid}] TTS task successfully intercepted and cancelled.")
+                pass 
+            # --------------------
             
+            # Clear the task map once speech is finished/cancelled
             tts_task_map[call_sid] = None 
 
     except Exception as e:
         print(f"Error in handle_complete_sentence: {e}")
-
 # ---------------- Helpers ----------------
 async def generate_call_summary(call_sid: str):
     """Generates a short summary of the conversation history."""
