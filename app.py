@@ -433,11 +433,11 @@ async def transcribe_raw_audio(raw_ulaw):
         return None
     except Exception: return None
 
-async def generate_smart_response(user_text: str, system_prompt: str, context_history: list):
+async def generate_smart_response(user_text: str, system_prompt: str, context_history: list, fixed_caller_id: str):
     if not groq_client: return "I apologize, I experienced a brief issue. Could you repeat that?"
     try:
         ssml_prompt = (
-            f"{system_prompt} The client is calling from: {fixed_caller_id}. " # <-- CRITICAL INJECTION
+            f"{system_prompt} The client is calling from: {fixed_caller_id}. "
             f"You must respond in a single SSML `<speak>` tag. "
             f"Keep your answer to one short sentence (max 20 words). "
             f"Use SSML tags like `<break time='300ms'/>` for natural pauses, and "
@@ -478,9 +478,8 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
         # Extract response text
         raw_response = completion.choices[0].message.content
         
-        # --- CRITICAL FIX: REGEX CLEANING ---
-        # 1. Replace any sequence of whitespace (tabs, newlines, multiple spaces) with a single space.
-        # 2. Strip any leading/trailing spaces.
+        # --- REGEX CLEANING ---
+        import re
         cleaned_response = re.sub(r'\s+', ' ', raw_response).strip()
         
         # Ensure the response is wrapped in <speak> tags if Groq lost them
