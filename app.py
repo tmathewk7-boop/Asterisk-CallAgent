@@ -388,6 +388,38 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
         print(f"Error in handle_complete_sentence: {e}")
 
 # ---------------- Helpers ----------------
+async def generate_call_summary(call_sid: str):
+    """Generates a short summary of the conversation history."""
+    if not groq_client or call_sid not in transcripts: return
+    full_text = "\n".join(transcripts[call_sid])
+    if not full_text: return
+    try:
+        loop = asyncio.get_running_loop()
+        completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "Summarize call in 2 words. Be extremely brief."},
+                {"role": "user", "content": full_text}
+            ],
+            model="llama-3.1-8b-instant", max_tokens=10
+        ))
+        if call_sid in call_db:
+            call_db[call_sid]["summary"] = completion.choices[0].message.content.strip()
+    except Exception as e:
+        print(f"Summary generation failed: {e}")
+        pass
+
+async def transcribe_raw_audio(raw_ulaw):
+    if not DEEPGRAM_API_KEY: return None
+    try:
+        url = "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&encoding=mulaw&sample_rate=8000"
+        headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "audio/basic"}
+        async with httpx.AsyncClient() as client:
+            response = await client.post(url, headers=headers, content=raw_ulaw)
+        data = response.json()
+        if 'results' in data: return data['results']['channels'][0]['alternatives'][0]['transcript']
+        return None
+    except Exception: return None
+
 async def generate_smart_response(user_text: str, system_prompt: str, context_history: list):
     if not groq_client: return "Error."
     try:
@@ -402,7 +434,6 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
         # --- CONSTRUCT MESSAGES ARRAY FROM HISTORY ---
         messages = [{"role": "system", "content": ssml_prompt}]
         
-        # Parse the context_history (e.g., "User: text" or "AI: text")
         for line in context_history:
             if line.startswith("User:"):
                 role = "user"
@@ -412,10 +443,9 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
                 content = line[3:].strip()
             else:
                 continue
-
+                
             # Skip the final message, which is passed separately as user_text
-            if content == user_text and role == "user":
-                continue
+            if content == user_text and role == "user": continue
                 
             messages.append({"role": role, "content": content})
 
@@ -430,49 +460,12 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
             max_tokens=100
         ))
         
-        # Extract response text, which should now be relevant to the context
         return completion.choices[0].message.content.strip()
         
     except Exception as e:
         print(f"Groq generation failed: {e}")
-        # Use a non-greeting fallback so it doesn't revert to intro
         return "I apologize, I experienced a brief issue. Could you repeat that?"
 
-async def transcribe_raw_audio(raw_ulaw):
-    if not DEEPGRAM_API_KEY: return None
-    try:
-        url = "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&encoding=mulaw&sample_rate=8000"
-        headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "audio/basic"}
-        async with httpx.AsyncClient() as client:
-            response = await client.post(url, headers=headers, content=raw_ulaw)
-        data = response.json()
-        if 'results' in data: return data['results']['channels'][0]['alternatives'][0]['transcript']
-        return None
-    except Exception: return None
-
-async def generate_smart_response(user_text, system_prompt, context_history):
-    if not groq_client: return "Error."
-    try:
-        # --- NEW PROMPT: Instructs Groq to use SSML tags ---
-        ssml_prompt = (
-            f"{system_prompt} You must respond in a single SSML `<speak>` tag. "
-            f"Keep your answer to one short sentence (max 20 words). "
-            f"Use SSML tags like `<break time='400ms'/>` for natural pauses, and "
-            f"`<say-as interpret-as='filler'>uh</say-as>` or `<say-as interpret-as='filler'>um</say-as>` "
-            f"for human-like conversational fluidity."
-        )
-        
-        loop = asyncio.get_running_loop()
-        completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": ssml_prompt}, 
-                {"role": "user", "content": user_text}
-            ],
-            model="llama-3.1-8b-instant", max_tokens=100
-        ))
-        # Ensure the response is stripped and returned as SSML text
-        return completion.choices[0].message.content.strip()
-    except Exception: return "I didn't catch that."
 
 async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str, call_sid: str):
     if not DEEPGRAM_API_KEY: return
@@ -487,12 +480,10 @@ async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str, call_sid:
                     if chunk:
                         payload = base64.b64encode(chunk).decode("ascii")
                         await ws.send_json({"event": "media", "streamSid": stream_sid, "media": {"payload": payload}})
-                        # Delay added for stability
                         await asyncio.sleep(0.001)
     except asyncio.CancelledError:
         print(f"[{call_sid}] TTS stream CANCELLED by user interrupt.")
-        # Re-raise the exception so the awaiting function knows it was cancelled
-        raise 
+        raise
     except Exception: 
         pass
 
