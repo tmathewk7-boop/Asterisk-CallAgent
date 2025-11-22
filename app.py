@@ -333,12 +333,24 @@ async def transcribe_raw_audio(raw_ulaw):
 async def generate_smart_response(user_text, system_prompt):
     if not groq_client: return "Error."
     try:
-        full_prompt = f"{system_prompt} Keep answer to 1 short sentence (max 15 words)."
+        # --- NEW PROMPT: Instructs Groq to use SSML tags ---
+        ssml_prompt = (
+            f"{system_prompt} You must respond in a single SSML `<speak>` tag. "
+            f"Keep your answer to one short sentence (max 20 words). "
+            f"Use SSML tags like `<break time='400ms'/>` for natural pauses, and "
+            f"`<say-as interpret-as='filler'>uh</say-as>` or `<say-as interpret-as='filler'>um</say-as>` "
+            f"for human-like conversational fluidity."
+        )
+        
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
-            messages=[{"role": "system", "content": full_prompt}, {"role": "user", "content": user_text}],
-            model="llama-3.1-8b-instant", max_tokens=60
+            messages=[
+                {"role": "system", "content": ssml_prompt}, 
+                {"role": "user", "content": user_text}
+            ],
+            model="llama-3.1-8b-instant", max_tokens=100
         ))
+        # Ensure the response is stripped and returned as SSML text
         return completion.choices[0].message.content.strip()
     except Exception: return "I didn't catch that."
 
