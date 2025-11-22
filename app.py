@@ -340,40 +340,80 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
         if not transcript: return
 
         print(f"[{call_sid}] User: {transcript}")
+        # Add the new line to the persistent transcripts dictionary
         transcripts[call_sid].append(f"User: {transcript}")
 
-        # --- NEW: TRUNCATE HISTORY TO LAST 10 LINES ---
+        # Truncate history to prevent looping (send last 10 lines)
         MAX_HISTORY_LINES = 10 
         context_history = transcripts[call_sid][-MAX_HISTORY_LINES:]
-
-        # Use Custom Prompt
+        
+        # Use Custom Prompt (fetched from active_call_config)
         config = active_call_config.get(call_sid, DEFAULT_CONFIG)
         custom_prompt = config.get("system_prompt", "You are a helpful assistant.")
 
+        # --- PASS HISTORY ---
         response_text = await generate_smart_response(transcript, custom_prompt, context_history)
+        
+        # Add AI response to history
         transcripts[call_sid].append(f"AI: {response_text}")
         
         ws = media_ws_map.get(call_sid)
         if ws:
             await send_deepgram_tts(ws, stream_sid, response_text)
 
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"Error in handle_complete_sentence: {e}")
 
 # ---------------- Helpers ----------------
-async def generate_call_summary(call_sid: str):
-    if not groq_client or call_sid not in transcripts: return
-    full_text = "\n".join(transcripts[call_sid])
-    if not full_text: return
+async def generate_smart_response(user_text: str, system_prompt: str, context_history: list):
+    if not groq_client: return "Error."
     try:
+        ssml_prompt = (
+            f"{system_prompt} You must respond in a single SSML `<speak>` tag. "
+            f"Keep your answer to one short sentence (max 20 words). "
+            f"Use SSML tags like `<break time='300ms'/>` for natural pauses, and "
+            f"`<say-as interpret-as='filler'>um</say-as>` or `<say-as interpret-as='filler'>uh</say-as>` "
+            f"for human-like conversational fluidity. Do not include the initial greeting."
+        )
+
+        # --- CONSTRUCT MESSAGES ARRAY FROM HISTORY ---
+        messages = [{"role": "system", "content": ssml_prompt}]
+        
+        # Parse the context_history (e.g., "User: text" or "AI: text")
+        for line in context_history:
+            if line.startswith("User:"):
+                role = "user"
+                content = line[5:].strip()
+            elif line.startswith("AI:"):
+                role = "assistant"
+                content = line[3:].strip()
+            else:
+                continue
+
+            # Skip the final message, which is passed separately as user_text
+            if content == user_text and role == "user":
+                continue
+                
+            messages.append({"role": role, "content": content})
+
+        # Add the current user input as the final message
+        messages.append({"role": "user", "content": user_text})
+
+        # --- CALL GROQ ---
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
-            messages=[{"role": "system", "content": "Summarize call in 6 words."}, {"role": "user", "content": full_text}],
-            model="llama-3.1-8b-instant", max_tokens=20
+            messages=messages,
+            model="llama-3.1-8b-instant",
+            max_tokens=100
         ))
-        if call_sid in call_db:
-            call_db[call_sid]["summary"] = completion.choices[0].message.content.strip()
-    except Exception: pass
+        
+        # Extract response text, which should now be relevant to the context
+        return completion.choices[0].message.content.strip()
+        
+    except Exception as e:
+        print(f"Groq generation failed: {e}")
+        # Use a non-greeting fallback so it doesn't revert to intro
+        return "I apologize, I experienced a brief issue. Could you repeat that?"
 
 async def transcribe_raw_audio(raw_ulaw):
     if not DEEPGRAM_API_KEY: return None
