@@ -43,6 +43,7 @@ media_ws_map = {}
 silence_counter = defaultdict(int)
 full_sentence_buffer = defaultdict(bytearray)
 active_call_config = {} 
+tts_task_map = {}
 
 # --- PERSISTENT SETTINGS ---
 def get_db_connection() -> Optional[pymysql.Connection]:
@@ -318,17 +319,35 @@ async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes
     pcm16 = audioop.ulaw2lin(audio_ulaw, 2)
     rms = audioop.rms(pcm16, 2)
     
-    if rms > 600:
+    # --- INTERRUPTION CHECK ---
+    if rms > 600: # User voice is loud enough to be an active speaker
         silence_counter[call_sid] = 0
+        
+        # Check if the AI is currently speaking (task is in the map)
+        if call_sid in tts_task_map and tts_task_map[call_sid] is not None:
+            print(f"[{call_sid}] USER INTERRUPT DETECTED. Canceling AI speech.")
+            
+            # Cancel the running TTS stream task immediately
+            tts_task_map[call_sid].cancel() 
+            tts_task_map[call_sid] = None
+            
+            # The current user speech is a new sentence, so clear the previous buffer
+            full_sentence_buffer[call_sid].clear()
+            
         full_sentence_buffer[call_sid].extend(audio_ulaw)
+        
     else:
+        # If the AI was just interrupted, or if no one is talking
         silence_counter[call_sid] += 1
 
-    if silence_counter[call_sid] >= 20: 
+    # --- END-OF-SENTENCE VAD LOGIC ---
+    if silence_counter[call_sid] >= 20: # 20 chunks = 400ms of silence
         if len(full_sentence_buffer[call_sid]) > 2000: 
             complete_audio = bytes(full_sentence_buffer[call_sid])
             full_sentence_buffer[call_sid].clear()
             silence_counter[call_sid] = 0
+            
+            # Trigger the LLM response after the user finishes speaking
             asyncio.create_task(handle_complete_sentence(call_sid, stream_sid, complete_audio))
         else:
             if len(full_sentence_buffer[call_sid]) > 0: full_sentence_buffer[call_sid].clear()
@@ -340,26 +359,30 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
         if not transcript: return
 
         print(f"[{call_sid}] User: {transcript}")
-        # Add the new line to the persistent transcripts dictionary
         transcripts[call_sid].append(f"User: {transcript}")
 
-        # Truncate history to prevent looping (send last 10 lines)
         MAX_HISTORY_LINES = 10 
         context_history = transcripts[call_sid][-MAX_HISTORY_LINES:]
         
-        # Use Custom Prompt (fetched from active_call_config)
         config = active_call_config.get(call_sid, DEFAULT_CONFIG)
         custom_prompt = config.get("system_prompt", "You are a helpful assistant.")
 
-        # --- PASS HISTORY ---
         response_text = await generate_smart_response(transcript, custom_prompt, context_history)
-        
-        # Add AI response to history
         transcripts[call_sid].append(f"AI: {response_text}")
         
         ws = media_ws_map.get(call_sid)
         if ws:
-            await send_deepgram_tts(ws, stream_sid, response_text)
+            # 1. Create the task, passing the call_sid to the TTS function
+            tts_task = asyncio.create_task(send_deepgram_tts(ws, stream_sid, response_text, call_sid))
+            
+            # 2. Store the task object for immediate interruption
+            tts_task_map[call_sid] = tts_task
+            
+            # 3. Wait for the task to finish (or be cancelled)
+            await tts_task
+            
+            # 4. Clear the task map once speech is finished
+            tts_task_map[call_sid] = None 
 
     except Exception as e:
         print(f"Error in handle_complete_sentence: {e}")
@@ -451,11 +474,12 @@ async def generate_smart_response(user_text, system_prompt, context_history):
         return completion.choices[0].message.content.strip()
     except Exception: return "I didn't catch that."
 
-async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str):
+async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str, call_sid: str):
     if not DEEPGRAM_API_KEY: return
     url = "https://api.deepgram.com/v1/speak?model=aura-asteria-en&encoding=mulaw&sample_rate=8000&container=none"
     headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "application/json"}
     payload = {"text": text}
+    
     try:
         async with httpx.AsyncClient() as client:
             async with client.stream("POST", url, headers=headers, json=payload) as response:
@@ -463,8 +487,14 @@ async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str):
                     if chunk:
                         payload = base64.b64encode(chunk).decode("ascii")
                         await ws.send_json({"event": "media", "streamSid": stream_sid, "media": {"payload": payload}})
+                        # Delay added for stability
                         await asyncio.sleep(0.001)
-    except Exception: pass
+    except asyncio.CancelledError:
+        print(f"[{call_sid}] TTS stream CANCELLED by user interrupt.")
+        # Re-raise the exception so the awaiting function knows it was cancelled
+        raise 
+    except Exception: 
+        pass
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
