@@ -315,7 +315,7 @@ async def media_ws_endpoint(ws: WebSocket):
     finally:
         if call_sid:
             if call_sid in call_db: call_db[call_sid]["status"] = "Ended"
-            asyncio.create_task(_call_summary(call_sid))
+            asyncio.create_task(generate_call_summary(call_sid))
             if call_sid in media_ws_map: del media_ws_map[call_sid]
             if call_sid in full_sentence_buffer: del full_sentence_buffer[call_sid]
             if call_sid in active_call_config: del active_call_config[call_sid]
@@ -436,6 +436,7 @@ async def transcribe_raw_audio(raw_ulaw):
 async def generate_smart_response(user_text: str, system_prompt: str, context_history: list, fixed_caller_id: str):
     if not groq_client: return "I apologize, I experienced a brief issue. Could you repeat that?"
     try:
+        ssml_fixed_caller_id = f'<say-as interpret-as="characters">{fixed_caller_id.replace("+", "")}</say-as>'
         ssml_prompt = (
             f"{system_prompt} The client is calling from: {ssml_fixed_caller_id}. "
             f"You must respond in a single SSML `<speak>` tag. "
@@ -476,12 +477,11 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
         ))
         
         # Extract response text
-        raw_response = completion.choices[0].message.content
-        
-        # --- REGEX CLEANING ---
         import re
+        raw_response = completion.choices[0].message.content
         cleaned_response = re.sub(r'\s+', ' ', raw_response).strip()
         
+        # --- REGEX CLEANING ---
         # Ensure the response is wrapped in <speak> tags if Groq lost them
         if not cleaned_response.startswith("<speak>"):
              return f"<speak>{cleaned_response}</speak>" 
