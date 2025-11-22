@@ -342,11 +342,15 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
         print(f"[{call_sid}] User: {transcript}")
         transcripts[call_sid].append(f"User: {transcript}")
 
+        # --- NEW: TRUNCATE HISTORY TO LAST 10 LINES ---
+        MAX_HISTORY_LINES = 10 
+        context_history = transcripts[call_sid][-MAX_HISTORY_LINES:]
+
         # Use Custom Prompt
         config = active_call_config.get(call_sid, DEFAULT_CONFIG)
         custom_prompt = config.get("system_prompt", "You are a helpful assistant.")
 
-        response_text = await generate_smart_response(transcript, custom_prompt)
+        response_text = await generate_smart_response(transcript, custom_prompt, context_history)
         transcripts[call_sid].append(f"AI: {response_text}")
         
         ws = media_ws_map.get(call_sid)
@@ -383,7 +387,7 @@ async def transcribe_raw_audio(raw_ulaw):
         return None
     except Exception: return None
 
-async def generate_smart_response(user_text, system_prompt):
+async def generate_smart_response(user_text, system_prompt, context_history):
     if not groq_client: return "Error."
     try:
         # --- NEW PROMPT: Instructs Groq to use SSML tags ---
