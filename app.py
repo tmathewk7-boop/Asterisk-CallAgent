@@ -552,6 +552,24 @@ async def extract_client_name(transcript: str, call_sid: str):
         else:
             print(f"[{call_sid}] FAIL: Name rejected. Cleaned name: '{cleaned_name}'.")
 
+# --- NEW ENDPOINT FOR TRANSCRIPT RETRIEVAL ---
+@app.get("/api/transcripts/{call_sid}")
+async def get_full_transcript(call_sid: str):
+    """Retrieves the full conversation history for a given Call SID."""
+    transcript_data = transcripts.get(call_sid)
+    
+    if transcript_data:
+        # Return the data as a clean list of strings
+        return {"call_sid": call_sid, "transcript": transcript_data}
+    else:
+        # Return summary if transcript is no longer in memory
+        summary = call_db.get(call_sid, {}).get("summary", "Transcript not found in active memory.")
+        return JSONResponse(
+            {"message": "Transcript not found in active memory. Call may have ended.", 
+             "summary": summary}, 
+            status_code=404
+        )
+
     except Exception as e:
         print(f"Error during name extraction: {e}")
         
