@@ -315,7 +315,7 @@ async def media_ws_endpoint(ws: WebSocket):
     finally:
         if call_sid:
             if call_sid in call_db: call_db[call_sid]["status"] = "Ended"
-            asyncio.create_task(generate_call_summary(call_sid))
+            asyncio.create_task(_call_summary(call_sid))
             if call_sid in media_ws_map: del media_ws_map[call_sid]
             if call_sid in full_sentence_buffer: del full_sentence_buffer[call_sid]
             if call_sid in active_call_config: del active_call_config[call_sid]
@@ -437,7 +437,7 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
     if not groq_client: return "I apologize, I experienced a brief issue. Could you repeat that?"
     try:
         ssml_prompt = (
-            f"{system_prompt} The client is calling from: {fixed_caller_id}. "
+            f"{system_prompt} The client is calling from: {ssml_fixed_caller_id}. "
             f"You must respond in a single SSML `<speak>` tag. "
             f"Keep your answer to one short sentence (max 20 words). "
             f"Use SSML tags like `<break time='300ms'/>` for natural pauses, and "
@@ -521,10 +521,10 @@ async def extract_client_name(transcript: str, call_sid: str):
 
     try:
         loop = asyncio.get_running_loop()
-        # Zero-shot prompt to extract the name
+        # --- FIX: STRICT, NO-APOLOGY EXTRACTION PROMPT ---
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "Analyze the following transcript. If the caller explicitly stated their full name, extract ONLY the name (first and last). Return the exact name or the word 'None'."}, 
+                {"role": "system", "content": "Analyze the transcript. Extract ONLY the caller's full name (First and Last). If no name is explicitly given, return ONLY the single, exact word 'None' (case-sensitive). Do not include any other text, apologies, or explanations."}, 
                 {"role": "user", "content": transcript}
             ],
             model="llama-3.1-8b-instant", max_tokens=15
@@ -532,15 +532,12 @@ async def extract_client_name(transcript: str, call_sid: str):
         
         extracted_name = completion.choices[0].message.content.strip()
 
-        # --- AGGRESSIVE CLEANING STEP ---
-        # 1. Remove surrounding quotes/dots
+        # Aggressively clean the extracted name
         cleaned_name = extracted_name.replace('"', '').replace('.', '').strip()
-        # 2. Capitalize each word for neat display
         cleaned_name = ' '.join(word.capitalize() for word in cleaned_name.split())
-        # --------------------------------
 
-        if cleaned_name.lower() not in ["none", ""] and len(cleaned_name) > 3:
-            # Update the call_db dictionary, which is reflected in the dashboard
+        # Check against 'None' and minimum length (to filter single letters/errors)
+        if cleaned_name.lower() != "none" and len(cleaned_name) > 3:
             if call_sid in call_db:
                 call_db[call_sid]["client_name"] = cleaned_name
                 print(f"[{call_sid}] Name Extracted and Updated: {cleaned_name}")
