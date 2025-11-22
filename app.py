@@ -229,6 +229,7 @@ async def twilio_incoming(request: Request):
         # === AI OFF: CALL FORWARDING LOGIC ===
         print(f"AI is OFF for {system_number}. Forwarding call...")
         response = VoiceResponse()
+        return Response(content=str(response), media_type="application/xml")
         
         personal_phone = config.get("personal_phone")
         
@@ -242,6 +243,7 @@ async def twilio_incoming(request: Request):
 
     # === AI ON: WEBSOCKET LOGIC ===
     active_call_config[call_sid] = config
+    active_call_config[call_sid]['caller_id'] = caller_number
 
     # Log Call
     city = form.get("FromCity", "")
@@ -373,6 +375,8 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
         config = active_call_config.get(call_sid, DEFAULT_CONFIG)
         custom_prompt = config.get("system_prompt", "You are a helpful assistant.")
 
+        fixed_caller_id = config.get("caller_id", "N/A")
+
         response_text = await generate_smart_response(transcript, custom_prompt, context_history)
         transcripts[call_sid].append(f"AI: {response_text}")
         
@@ -430,7 +434,8 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
     if not groq_client: return "I apologize, I experienced a brief issue. Could you repeat that?"
     try:
         ssml_prompt = (
-            f"{system_prompt} You must respond in a single SSML `<speak>` tag. "
+            f"{system_prompt} The client is calling from: {fixed_caller_id}. " # <-- CRITICAL INJECTION
+            f"You must respond in a single SSML `<speak>` tag. "
             f"Keep your answer to one short sentence (max 20 words). "
             f"Use SSML tags like `<break time='300ms'/>` for natural pauses, and "
             f"`<say-as interpret-as='filler'>um</say-as>` or `<say-as interpret-as='filler'>uh</say-as>` "
@@ -509,7 +514,7 @@ async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str, call_sid:
         pass
 
 async def extract_client_name(transcript: str, call_sid: str):
-    """Uses Groq's low-latency API to extract the caller's name from a transcript segment."""
+    """Uses Groq's low-latency API to extract and aggressively clean the caller's name."""
     if not groq_client or not transcript: return
 
     try:
@@ -517,7 +522,7 @@ async def extract_client_name(transcript: str, call_sid: str):
         # Zero-shot prompt to extract the name
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "Analyze the following transcript. If the caller explicitly stated their full name, extract ONLY the name (first and last). If no name is given, return the word 'None'."}, 
+                {"role": "system", "content": "Analyze the following transcript. If the caller explicitly stated their full name, extract ONLY the name (first and last). Return the exact name or the word 'None'."}, 
                 {"role": "user", "content": transcript}
             ],
             model="llama-3.1-8b-instant", max_tokens=15
@@ -525,11 +530,18 @@ async def extract_client_name(transcript: str, call_sid: str):
         
         extracted_name = completion.choices[0].message.content.strip()
 
-        if extracted_name.lower() not in ["none", ""]:
+        # --- AGGRESSIVE CLEANING STEP ---
+        # 1. Remove surrounding quotes/dots
+        cleaned_name = extracted_name.replace('"', '').replace('.', '').strip()
+        # 2. Capitalize each word for neat display
+        cleaned_name = ' '.join(word.capitalize() for word in cleaned_name.split())
+        # --------------------------------
+
+        if cleaned_name.lower() not in ["none", ""] and len(cleaned_name) > 3:
             # Update the call_db dictionary, which is reflected in the dashboard
             if call_sid in call_db:
-                call_db[call_sid]["client_name"] = extracted_name
-                print(f"[{call_sid}] Name Extracted and Updated: {extracted_name}")
+                call_db[call_sid]["client_name"] = cleaned_name
+                print(f"[{call_sid}] Name Extracted and Updated: {cleaned_name}")
                 
     except Exception as e:
         print(f"Error during name extraction: {e}")
