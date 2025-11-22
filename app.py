@@ -354,7 +354,7 @@ async def process_audio_stream(call_sid: str, stream_sid: str, audio_ulaw: bytes
             silence_counter[call_sid] = 0
             
             # Trigger the LLM response after the user finishes speaking
-            asyncio.create_task(handle_complete_sentence(call_sid, stream_sid, complete_audio))
+            asyncio.create_task(_sentence(call_sid, stream_sid, complete_audio))
         else:
             if len(full_sentence_buffer[call_sid]) > 0: full_sentence_buffer[call_sid].clear()
             silence_counter[call_sid] = 0
@@ -367,31 +367,30 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
         print(f"[{call_sid}] User: {transcript}")
         transcripts[call_sid].append(f"User: {transcript}")
 
-        asyncio.create_task(extract_client_name(transcript, call_sid))
-
         MAX_HISTORY_LINES = 10 
         context_history = transcripts[call_sid][-MAX_HISTORY_LINES:]
         
         config = active_call_config.get(call_sid, DEFAULT_CONFIG)
         custom_prompt = config.get("system_prompt", "You are a helpful assistant.")
+        
+        # --- FIX: Retrieve the stored Caller ID ---
+        fixed_caller_id = config.get("caller_id", "N/A") 
 
-        fixed_caller_id = config.get("caller_id", "N/A")
-
-        response_text = await generate_smart_response(transcript, custom_prompt, context_history)
+        # Run name extraction in background
+        asyncio.create_task(extract_client_name(transcript, call_sid))
+        
+        # --- FIX: Pass the required fixed_caller_id argument ---
+        response_text = await generate_smart_response(transcript, custom_prompt, context_history, fixed_caller_id)
+        
         transcripts[call_sid].append(f"AI: {response_text}")
         
         ws = media_ws_map.get(call_sid)
         if ws:
-            # 1. Create the task, passing the call_sid to the TTS function
             tts_task = asyncio.create_task(send_deepgram_tts(ws, stream_sid, response_text, call_sid))
-            
-            # 2. Store the task object for immediate interruption
             tts_task_map[call_sid] = tts_task
             
-            # 3. Wait for the task to finish (or be cancelled)
             await tts_task
             
-            # 4. Clear the task map once speech is finished
             tts_task_map[call_sid] = None 
 
     except Exception as e:
