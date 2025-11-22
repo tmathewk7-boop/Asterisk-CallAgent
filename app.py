@@ -197,6 +197,7 @@ async def server_status():
     return {"status": "online"}
 
 # ---------------- TwiML (UPDATED FOR TOGGLE) ----------------
+# --- REPLACEMENT FOR /twilio/incoming ---
 @app.post("/twilio/incoming")
 async def twilio_incoming(request: Request):
     form = await request.form()
@@ -204,11 +205,23 @@ async def twilio_incoming(request: Request):
     caller_number = form.get("From", "Unknown")
     system_number = form.get("To", "") # The number they dialed
     
-    # Load User Config
-    config = USER_CONFIGS.get(system_number, DEFAULT_CONFIG)
+    # 1. Load User Config from the DATABASE
+    config = get_user_settings(system_number) 
+
+    # Fallback to default configuration if DB returned no specific settings
+    # Note: ai_active, system_prompt, greeting are all now fields in the DB
+    default_config = {
+        "system_prompt": "You are a helpful assistant. Be concise.",
+        "greeting": "Hello! I am your AI assistant.",
+        "ai_active": True,
+        "personal_phone": ""
+    }
     
+    # Merge DB settings with defaults
+    config = {**default_config, **config}
+
     # --- CHECK IF AI IS ACTIVE ---
-    is_active = config.get("active", True)
+    is_active = config.get("ai_active", True)
     
     if not is_active:
         # === AI OFF: CALL FORWARDING LOGIC ===
@@ -221,7 +234,6 @@ async def twilio_incoming(request: Request):
             response.say("Connecting you to the user.")
             response.dial(personal_phone)
         else:
-            # Fallback if no forwarding number is set
             response.say("The person you are calling is unavailable and has not set a forwarding number.")
             
         return Response(content=str(response), media_type="application/xml")
