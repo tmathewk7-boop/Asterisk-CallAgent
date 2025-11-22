@@ -1,4 +1,5 @@
 import os
+import pymysql
 import base64
 import json
 import asyncio
@@ -7,7 +8,7 @@ import httpx
 import datetime
 from collections import defaultdict
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, Dict, Any
 
 # --- IMPORTS ---
 from groq import Groq
@@ -24,7 +25,6 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 PORT = int(os.getenv("PORT", 8000))
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://your-app.onrender.com")
-SETTINGS_FILE = "user_settings.json"
 
 if GROQ_API_KEY:
     groq_client = Groq(api_key=GROQ_API_KEY)
@@ -45,21 +45,38 @@ full_sentence_buffer = defaultdict(bytearray)
 active_call_config = {} 
 
 # --- PERSISTENT SETTINGS ---
-def load_settings():
-    if os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE, "r") as f:
-                return json.load(f)
-        except:
-            pass
-    return {}
+def get_db_connection() -> Optional[pymysql.Connection]:
+    try:
+        conn = pymysql.connect(
+            host=os.getenv("DB_HOST"),
+            user=os.getenv("DB_USER"),
+            password=os.getenv("DB_PASSWORD"),
+            database=os.getenv("DB_NAME"),
+            connect_timeout=5,
+            cursorclass=pymysql.cursors.DictCursor
+        )
+        return conn
+    except Exception as e:
+        print(f"DB Connection error: {e}")
+        return None
 
-def save_settings(data):
-    with open(SETTINGS_FILE, "w") as f:
-        json.dump(data, f, indent=2)
-
-# Load on startup
-USER_CONFIGS = load_settings()
+def get_user_settings(phone_number: str) -> Dict[str, Any]:
+    conn = get_db_connection()
+    if not conn:
+        return {}
+    try:
+        with conn.cursor() as cursor:
+            sql = """
+                SELECT system_prompt, greeting, personal_phone, ai_active 
+                FROM users 
+                WHERE phone_number = %s
+            """
+            cursor.execute(sql, (phone_number,))
+            settings = cursor.fetchone()
+            return settings if settings else {}
+    finally:
+        if conn:
+            conn.close()
 
 DEFAULT_CONFIG = {
     "system_prompt": "You are a helpful assistant. Be concise.",
@@ -114,42 +131,66 @@ async def delete_calls(req: DeleteCallsRequest):
 
 @app.get("/api/settings/{target_number}")
 async def get_settings(target_number: str):
-    """Get AI settings for a specific user."""
-    return USER_CONFIGS.get(target_number, DEFAULT_CONFIG)
+    """Get AI settings for a specific user from the Database."""
+    settings = get_user_settings(target_number)
+    
+    # Fallback to defaults if user is not in the DB or has no settings saved
+    default_config = {
+        "system_prompt": "You are a helpful assistant. Be concise.",
+        "greeting": "Hello! I am your AI assistant.",
+        "ai_active": True,
+        "personal_phone": ""
+    }
+    
+    # Merge DB settings with defaults
+    return {**default_config, **settings}
 
 @app.post("/api/settings")
 async def update_settings(settings: AgentSettings):
-    """Update AI settings (Prompt, Greeting, Personal Phone)."""
-    print(f"Saving settings for {settings.phone_number}")
-    
-    # Get existing or default
-    current = USER_CONFIGS.get(settings.phone_number, DEFAULT_CONFIG.copy())
-    
-    # Update fields if provided
-    if settings.system_prompt: current["system_prompt"] = settings.system_prompt
-    if settings.greeting: current["greeting"] = settings.greeting
-    if settings.personal_phone: current["personal_phone"] = settings.personal_phone
-    
-    USER_CONFIGS[settings.phone_number] = current
-    save_settings(USER_CONFIGS)
-    return {"status": "success"}
+    """Update AI settings in the Database."""
+    conn = get_db_connection()
+    if not conn:
+        return JSONResponse({"status": "error", "message": "Database unavailable"}, status_code=500)
+    try:
+        with conn.cursor() as cursor:
+            sql = """
+                UPDATE users SET 
+                    system_prompt = %s, 
+                    greeting = %s, 
+                    personal_phone = %s
+                WHERE phone_number = %s
+            """
+            cursor.execute(sql, (
+                settings.system_prompt,
+                settings.greeting,
+                settings.personal_phone,
+                settings.phone_number
+            ))
+        conn.commit()
+        return {"status": "success"}
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+    finally:
+        if conn:
+            conn.close()
 
 @app.post("/toggle")
 async def toggle_agent(req: ToggleRequest):
-    """Turn the AI ON or OFF for a specific number."""
-    phone = req.phone_number
-    
-    # Get existing config or create new default
-    current = USER_CONFIGS.get(phone, DEFAULT_CONFIG.copy())
-    
-    # Update active state
-    current["active"] = req.active
-    USER_CONFIGS[phone] = current
-    save_settings(USER_CONFIGS)
-    
-    state_str = "ON" if req.active else "OFF"
-    print(f"Toggled {phone} to {state_str}")
-    return {"status": "success", "active": req.active}
+    """Turn the AI ON or OFF in the Database."""
+    conn = get_db_connection()
+    if not conn:
+        return JSONResponse({"status": "error", "message": "Database unavailable"}, status_code=500)
+    try:
+        with conn.cursor() as cursor:
+            sql = "UPDATE users SET ai_active = %s WHERE phone_number = %s"
+            cursor.execute(sql, (req.active, req.phone_number))
+        conn.commit()
+        return {"status": "success", "active": req.active}
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+    finally:
+        if conn:
+            conn.close()
 
 @app.get("/status")
 async def server_status():
