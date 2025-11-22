@@ -251,7 +251,7 @@ async def twilio_incoming(request: Request):
         "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
         "number": caller_number,
         "system_number": system_number,
-        "client_name": "Client",
+        "client_name": caller_number,
         "location": location,
         "status": "Live",
         "summary": None
@@ -363,6 +363,8 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
 
         print(f"[{call_sid}] User: {transcript}")
         transcripts[call_sid].append(f"User: {transcript}")
+
+        asyncio.create_task(extract_client_name(transcript, call_sid))
 
         MAX_HISTORY_LINES = 10 
         context_history = transcripts[call_sid][-MAX_HISTORY_LINES:]
@@ -491,6 +493,32 @@ async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str, call_sid:
         raise 
     except Exception: 
         pass
+
+    async def extract_client_name(transcript: str, call_sid: str):
+    """Uses Groq's low-latency API to extract the caller's name from a transcript segment."""
+    if not groq_client or not transcript: return
+
+    try:
+        loop = asyncio.get_running_loop()
+        # Zero-shot prompt to extract the name
+        completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": "Analyze the following transcript. If the caller explicitly stated their full name, extract ONLY the name (first and last). If no name is given, return the word 'None'."}, 
+                {"role": "user", "content": transcript}
+            ],
+            model="llama-3.1-8b-instant", max_tokens=15
+        ))
+        
+        extracted_name = completion.choices[0].message.content.strip()
+
+        if extracted_name.lower() not in ["none", ""]:
+            # Update the call_db dictionary, which is reflected in the dashboard
+            if call_sid in call_db:
+                call_db[call_sid]["client_name"] = extracted_name
+                print(f"[{call_sid}] Name Extracted and Updated: {extracted_name}")
+                
+    except Exception as e:
+        print(f"Error during name extraction: {e}")
         
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
