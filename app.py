@@ -437,8 +437,29 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
             f"for human-like conversational fluidity. Do not include the initial greeting."
         )
 
-        # ... (rest of the messages construction code remains the same) ...
+        # --- CONSTRUCT MESSAGES ARRAY FROM HISTORY ---
+        messages = [{"role": "system", "content": ssml_prompt}]
+        
+        # Parse the context_history (e.g., "User: text" or "AI: text")
+        for line in context_history:
+            if line.startswith("User:"):
+                role = "user"
+                content = line[5:].strip()
+            elif line.startswith("AI:"):
+                role = "assistant"
+                content = line[3:].strip()
+            else:
+                continue
+                
+            # Skip the final message, which is passed separately as user_text
+            if content == user_text and role == "user": continue
+                
+            messages.append({"role": role, "content": content})
 
+        # Add the current user input as the final message
+        messages.append({"role": "user", "content": user_text})
+
+        # --- CALL GROQ ---
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=messages,
@@ -446,16 +467,16 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
             max_tokens=100
         ))
         
-        # --- NEW POST-PROCESSING LOGIC ---
+        # Extract response text
         raw_response = completion.choices[0].message.content
         
-        # Use regex to replace any sequence of whitespace (multiple spaces, newlines, etc.) 
-        # with a single space, guaranteeing clean word separation for the TTS engine.
+        # --- CRITICAL FIX: REGEX CLEANING ---
+        # 1. Replace any sequence of whitespace (tabs, newlines, multiple spaces) with a single space.
+        # 2. Strip any leading/trailing spaces.
         cleaned_response = re.sub(r'\s+', ' ', raw_response).strip()
         
-        # Now, check if the response is still valid SSML before returning
+        # Ensure the response is wrapped in <speak> tags if Groq lost them
         if not cleaned_response.startswith("<speak>"):
-             # Fallback to plain text if the SSML structure was lost/corrupted
              return f"<speak>{cleaned_response}</speak>" 
         
         return cleaned_response
