@@ -629,8 +629,8 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
         # --- REGEX CLEANING ---
         # Ensure the response is wrapped in <speak> tags if Groq lost them
         if not cleaned_response.startswith("<speak>"):
-                return f"<speak>{cleaned_response}</speak>" 
-            
+             return f"<speak>{cleaned_response}</speak>"
+             
         return cleaned_response
             
     except Exception as e:
