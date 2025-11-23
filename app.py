@@ -274,6 +274,69 @@ async def twilio_incoming(request: Request):
 </Response>"""
     return Response(content=twiml, media_type="application/xml")
 
+
+
+# ---------------- Booker ----------------
+@app.get("/outlook/connect")
+async def outlook_connect():
+    """Redirects the user to the Microsoft login page to grant calendar permission."""
+    scopes = "openid offline_access Calendars.ReadWrite"
+    
+    redirect_uri = (
+        f"{MS_AUTH_URL}?"
+        f"client_id={MS_CLIENT_ID}&"
+        f"response_type=code&"
+        f"redirect_uri={MS_REDIRECT_URI}&"
+        f"scope={scopes}"
+    )
+    return RedirectResponse(url=redirect_uri)
+
+@app.get("/outlook/auth-callback")
+async def outlook_auth_callback(code: Optional[str] = None):
+    """Handles the redirect from Microsoft, exchanges the code for tokens, and saves them."""
+    if not code:
+        return HTMLResponse("<h1>Outlook connection failed. No code received.</h1>", status_code=400)
+
+    # 1. Exchange Code for Tokens
+    token_data = {
+        "client_id": MS_CLIENT_ID,
+        "client_secret": MS_CLIENT_SECRET,
+        "code": code,
+        "redirect_uri": MS_REDIRECT_URI,
+        "grant_type": "authorization_code"
+    }
+    
+    async with httpx.AsyncClient() as client:
+        response = await client.post(MS_TOKEN_URL, data=token_data)
+        
+    if not response.is_success:
+        print(f"Token exchange failed: {response.text}")
+        return HTMLResponse("<h1>Token exchange failed.</h1>", status_code=500)
+
+    tokens = response.json()
+    refresh_token = tokens.get("refresh_token")
+    access_token = tokens.get("access_token")
+
+    # 2. Get User Email (Need to use the Access Token)
+    async with httpx.AsyncClient() as client:
+        headers = {"Authorization": f"Bearer {access_token}"}
+        user_info_response = await client.get(f"{MS_GRAPH_URL}/me?$select=mail", headers=headers)
+        
+    if not user_info_response.is_success:
+        return HTMLResponse("<h1>Could not retrieve user email.</h1>", status_code=500)
+    
+    outlook_email = user_info_response.json().get("mail")
+
+    # 3. Save Tokens (Need an endpoint/function to update the users table)
+    if refresh_token and outlook_email:
+        success = save_outlook_tokens(outlook_email, refresh_token)
+        if success:
+            return HTMLResponse(f"<h1>Outlook Connected!</h1><p>Email: {outlook_email}</p><p>You can now close this window.</p>")
+        else:
+            return HTMLResponse("<h1>Failed to save tokens to database.</h1>", status_code=500)
+    
+    return HTMLResponse("<h1>Connection failed due to missing tokens.</h1>", status_code=500)
+
 # ---------------- WebSocket ----------------
 @app.websocket("/media-ws")
 async def media_ws_endpoint(ws: WebSocket):
