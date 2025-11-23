@@ -442,7 +442,8 @@ async def transcribe_raw_audio(raw_ulaw):
 async def generate_smart_response(user_text: str, system_prompt: str, context_history: list, fixed_caller_id: str):
     if not groq_client: return "I apologize, I experienced a brief issue. Could you repeat that?"
     try:
-        ssml_fixed_caller_id = f'<say-as interpret-as="characters">{fixed_caller_id.replace("+", "")}</say-as>'
+        cleaned_phone_digits = fixed_caller_id.lstrip('+').lstrip('1') 
+        ssml_fixed_caller_id = f'<say-as interpret-as="characters">{cleaned_phone_digits}</say-as>'
         ssml_prompt = (
             f"{system_prompt} The client is calling from: {ssml_fixed_caller_id}. "
             f"You must respond in a single SSML `<speak>` tag. "
