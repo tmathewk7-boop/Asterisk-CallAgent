@@ -552,6 +552,9 @@ async def extract_client_name(transcript: str, call_sid: str):
         else:
             print(f"[{call_sid}] FAIL: Name rejected. Cleaned name: '{cleaned_name}'.")
 
+    except Exception as e:
+        print(f"Error during name extraction: {e}")
+
 # --- NEW ENDPOINT FOR TRANSCRIPT RETRIEVAL ---
 @app.get("/api/transcripts/{call_sid}")
 async def get_full_transcript(call_sid: str):
@@ -570,8 +573,7 @@ async def get_full_transcript(call_sid: str):
             status_code=404
         )
 
-    except Exception as e:
-        print(f"Error during name extraction: {e}")
+
         
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
