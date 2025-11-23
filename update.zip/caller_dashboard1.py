@@ -1,5 +1,5 @@
 """
-caller_dashboard1.py — VerityLink AI Dashboard (Fixed Attribute Error)
+caller_dashboard1.py — VerityLink AI Dashboard (Fixed Structure & Updater)
 """
 import pymysql
 import hashlib
@@ -8,11 +8,11 @@ import zipfile
 import json
 import threading
 import os
-from typing import Dict, List
+from typing import Dict, List, Any
 import requests
-from datetime import datetime
 import platform
 import time
+from datetime import datetime, timezone # Imports the class 'datetime' and class 'timezone'
 
 # Optional timezone
 try:
@@ -40,6 +40,9 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QStackedWidget,
     QLineEdit,
+    QCalendarWidget, 
+    QSplitter,
+    QScrollArea,
     QMessageBox,
     QScrollBar
 )
@@ -47,6 +50,7 @@ from PyQt6.QtCore import (
     Qt,
     QTimer,
     QThread,
+    QDate,
     pyqtSignal,
     QAbstractTableModel,
     QPropertyAnimation,
@@ -75,7 +79,7 @@ STATUS_POLL_MS = 10_000
 HTTP_TIMEOUT = 30
 CONFIG_PATH = os.path.expanduser("~/.caller_dashboard_config.json")
 SETTINGS_FILE = "agent_settings.json"
-CURRENT_VERSION = "1.0.2" 
+CURRENT_VERSION = "1.0.0.2" 
 
 VERSION_URL = "https://github.com/tmathewk7-boop/Asterisk-CallAgent/edit/main/update.zip/version.json"
 UPDATE_ZIP_URL = "https://github.com/tmathewk7-boop/Asterisk-CallAgent/edit/main/update.zip"
@@ -173,16 +177,20 @@ def login_user(username, password):
     finally:
         conn.close()
 
-def resource_path(filename: str):
-    if hasattr(sys, "_MEIPASS"):
-        return os.path.join(sys._MEIPASS, filename)
-    return os.path.join(os.path.dirname(__file__), filename)
+def resource_path(relative_path: str):
+    """Get absolute path to resource, works for dev and for PyInstaller."""
+    base_path = getattr(sys, '_MEIPASS', os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base_path, relative_path)
 
 # -----------------------------
-# VERSION & UPDATES
+# UPDATER LOGIC
 # -----------------------------
+
+# --- PASTE THIS MISSING FUNCTION ---
 def fetch_version_info():
+    """Fetches version.json from the remote server."""
     try:
+        # Use timestamp to bypass cache
         r = requests.get(f"{VERSION_URL}?t={int(time.time())}", timeout=5)
         if r.status_code == 200:
             try:
@@ -195,44 +203,33 @@ def fetch_version_info():
         print("Error fetching version info:", e)
         return None
 
-def check_for_updates(parent=None):
-    data = fetch_version_info()
-    if not data:
-        return False
-
-    # Ensure this key matches your version.json file structure
-    latest_version = data.get("version", CURRENT_VERSION)
-    if latest_version != CURRENT_VERSION:
-        changelog = data.get("changelog", "")
-        dl_url = data.get("download_url", UPDATE_ZIP_URL)
-        
-        reply = QMessageBox.question(
-            parent,
-            "Update Available",
-            f"A new version ({latest_version}) is available!\n\nChangelog:\n{changelog}\n\nDo you want to download and install it?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            download_and_install(dl_url)
-        return True
-    return False
-
 def download_and_install(url):
     try:
         local_zip = "update.zip"
+        
+        # 1. Download the file
+        print(f"Downloading update from: {url}")
         r = requests.get(url, stream=True)
+        if r.status_code != 200:
+            raise Exception(f"Download failed with status code {r.status_code}")
+            
         with open(local_zip, "wb") as f:
             for chunk in r.iter_content(1024):
                 f.write(chunk)
 
+        # 2. Extract files into the current directory, overwriting existing files
+        print(f"Extracting {local_zip}...")
         with zipfile.ZipFile(local_zip, "r") as zip_ref:
             zip_ref.extractall(os.getcwd())
         
+        # 3. Clean up
         os.remove(local_zip)
-        QMessageBox.information(None, "Update Complete", "Update installed. The application will now close. Please restart it.")
+        
+        # 4. Success message and exit
+        QMessageBox.information(None, "Update Complete", "Update installed successfully! The application will now close. Please restart it to use the new version.")
         sys.exit(0)
     except Exception as e:
-        QMessageBox.warning(None, "Update Failed", f"Failed to update: {e}")
+        QMessageBox.warning(None, "Update Failed", f"Failed to update or install files: {e}")
 
 # -----------------------------
 # TERMS & ACCEPTANCE
@@ -536,10 +533,10 @@ class StartupScreen(QWidget):
         self.loading.setText(f"Initializing{self.dots[self.i]}")
         self.i = (self.i + 1) % 4
 
+
 # -----------------------------
 # WORKER THREADS
 # -----------------------------
-
 class GenericRequestWorker(QThread):
     finished = pyqtSignal(object)
 
@@ -567,31 +564,44 @@ class FetchWorker(QThread):
     def run(self):
         try:
             url = f"{GET_CALLS_URL}/{self.phone_number}"
-            print(f"Attempting to fetch calls from: {url}") # DEBUG PRINT
-            
-            # verify=False helps if the .exe cannot find SSL certs (Use with caution in production)
-            # HTTP_TIMEOUT allows time for Render to wake up
-            r = requests.get(url, timeout=HTTP_TIMEOUT) # Removed verify=False for security, but add it back if SSL error persists
+            # verify=False helps if the .exe cannot find SSL certs
+            r = requests.get(url, timeout=HTTP_TIMEOUT) 
             
             if r.status_code == 200:
                 data = r.json()
                 if isinstance(data, list):
                     self.fetched.emit(data)
                 else:
-                    print(f"Unexpected data format: {type(data)}")
                     self.fetched.emit([])
             else:
                 print(f"Server returned status code: {r.status_code}")
                 self.fetched.emit([])
-        except requests.exceptions.ConnectionError:
-            print("Connection Error: Could not reach Render server.")
-            self.error.emit("Connection Error")
-        except requests.exceptions.Timeout:
-            print("Timeout: Render server took too long to respond (waking up?).")
-            self.error.emit("Timeout")
         except Exception as e:
             print(f"Fetch Error: {e}")
             self.error.emit(str(e))
+
+class UpdateCheckWorker(QThread):
+    """Worker to fetch version info without blocking the UI."""
+    fetched = pyqtSignal(object)
+
+    def __init__(self):
+        super().__init__()
+
+    def run(self):
+        try:
+            # Use a timestamp to prevent aggressive caching
+            url = f"{VERSION_URL}?t={int(time.time())}"
+            r = requests.get(url, timeout=5)
+            
+            if r.status_code == 200:
+                data = r.json()
+                self.fetched.emit(data)
+            else:
+                self.fetched.emit(None)
+        except Exception as e:
+            print("Error fetching version info:", e)
+            self.fetched.emit(None)
+
 
 # -----------------------------
 # TABLE MODEL
@@ -600,7 +610,7 @@ class CallsTableModel(QAbstractTableModel):
     def __init__(self, data=None):
         super().__init__()
         self.columns = ["selected", "name", "phone", "timestamp", "summary"]
-        self.headers = ["", "Name", "Phone", "Timestamp", "Summary"]
+        self.headers = ["", "Name", "Phone", "Timestamp", "Reason"]
         self._data = []
         if data:
             self.set_data(data)
@@ -615,7 +625,7 @@ class CallsTableModel(QAbstractTableModel):
                 "phone": d.get("number", "Unknown"),
                 "timestamp": d.get("timestamp", ""),
                 "summary": d.get("summary", ""),
-                "sid": d.get("sid")  # <--- CRITICAL: We must store the SID here
+                "sid": d.get("sid") 
             })
         self.endResetModel()
 
@@ -631,8 +641,30 @@ class CallsTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.DisplayRole:
             if key == "selected":
                 return ""
+            
+            if key == "timestamp":
+                timestamp_str = self._data[row][key]
+                try:
+                    if timestamp_str.endswith("Z"):
+                        dt_utc = datetime.fromisoformat(timestamp_str.rstrip("Z") + "+00:00")
+                    else:
+                        dt_utc = datetime.fromisoformat(timestamp_str)
+                    
+                    dt_local = dt_utc.astimezone(LOCAL_TZ)
+                    return dt_local.strftime("%b %d, %Y %I:%M")
+                except Exception:
+                    return "N/A"
+            
             return str(self._data[row][key])
 
+        if role == Qt.ItemDataRole.TextAlignmentRole:
+            if key == "selected":
+                return Qt.AlignmentFlag.AlignCenter
+            elif key in ["name", "summary"]:
+                return Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft
+            elif key in ["phone", "timestamp"]:
+                return Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignCenter
+        
         return None
 
     def rowCount(self, parent=None):
@@ -690,17 +722,13 @@ class CallAgentPage(QWidget):
         layout.setContentsMargins(30, 30, 30, 30)
         layout.setSpacing(20)
 
-        # --- 1. PAGE TITLE ROW ---
         header_row = QHBoxLayout()
-        
         title = QLabel("Call Agent")
         title.setFont(QFont("Segoe UI", 22, QFont.Weight.Bold))
         title.setStyleSheet("color: #ffffff;")
         header_row.addWidget(title)
-
         header_row.addStretch()
 
-        # Status Badge
         self.info_label = QLabel("● Online")
         self.info_label.setStyleSheet("""
             color: #888; background-color: #151515; 
@@ -710,7 +738,6 @@ class CallAgentPage(QWidget):
         header_row.addWidget(self.info_label)
         layout.addLayout(header_row)
 
-        # --- 2. TABLE FRAME ---
         table_frame = QFrame()
         table_frame.setStyleSheet(f"""
             QFrame {{
@@ -727,7 +754,6 @@ class CallAgentPage(QWidget):
         self.model = CallsTableModel([])
         self.table.setModel(self.model)
         
-        # --- HEADER & TABLE STYLING ---
         self.table.setStyleSheet(f"""
             QTableView {{
                 background-color: transparent;
@@ -740,8 +766,8 @@ class CallAgentPage(QWidget):
                 border-bottom: 1px solid #1e1e1e;
                 color: #e0e0e0;
                 height: 50px;
+                padding-left: 15px;
             }}
-            /* --- THE HEADER BAR --- */
             QHeaderView {{
                 background-color: #1a1a1a;
                 border: none;
@@ -756,50 +782,39 @@ class CallAgentPage(QWidget):
                 padding: 5px;
                 border: none;
                 border-right: 1px solid #2a2a2a;
+                text-align: left; 
             }}
             QHeaderView::section:last {{
                 border-right: none;
             }}
         """)
         
-        # Table Behavior
         self.table.verticalHeader().setVisible(False)
         self.table.verticalHeader().setDefaultSectionSize(55)
         self.table.setFocusPolicy(Qt.FocusPolicy.NoFocus)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self.table.setShowGrid(False)
 
-        # --- COLUMN CONFIGURATION ---
         header = self.table.horizontalHeader()
-        header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
-        
-        # Resize Modes
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter) 
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         header.resizeSection(0, 45)
-        
-        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch) # Name stretches
-        
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         header.resizeSection(2, 140)
-        
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         header.resizeSection(3, 100)
-        
-        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch) # Summary stretches
+        header.setSectionResizeMode(4, QHeaderView.ResizeMode.Stretch)
 
         frame_layout.addWidget(self.table)
         layout.addWidget(table_frame)
 
-        # --- 3. BOTTOM BUTTONS ---
         btn_row = QHBoxLayout()
-        
-        # SYNC BUTTON
         self.refresh_btn = QPushButton("Refresh")
         self.refresh_btn.setFixedWidth(100)
         self.refresh_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self.refresh_btn.clicked.connect(self.refresh)
         
-        # DELETE BUTTON (With Hover)
         self.del_btn = QPushButton("Delete")
         self.del_btn.setFixedWidth(100)
         self.del_btn.setCursor(Qt.CursorShape.PointingHandCursor)
@@ -812,9 +827,9 @@ class CallAgentPage(QWidget):
                 font-weight: bold;
             }
             QPushButton:hover {
-                background-color: #552222; /* Lighter Red Background */
-                border: 1px solid #ff6b6b; /* Bright Red Border */
-                color: #ffffff;            /* White Text */
+                background-color: #552222; 
+                border: 1px solid #ff6b6b;
+                color: #ffffff;
             }
             QPushButton:pressed {
                 background-color: #2a0a0a;
@@ -828,7 +843,6 @@ class CallAgentPage(QWidget):
         
         layout.addLayout(btn_row)
 
-        # Timers
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.refresh)
         self.timer.start(AUTO_REFRESH_MS)
@@ -856,6 +870,310 @@ class CallAgentPage(QWidget):
             sids = [r["sid"] for r in checked if r.get("sid")]
             threading.Thread(target=lambda: requests.post(DELETE_URL, json={"call_sids": sids}), daemon=True).start()
             QTimer.singleShot(500, self.refresh)
+
+
+# -----------------------------
+# BOOKING PAGE COMPONENTS
+# -----------------------------
+class EventCard(QFrame):
+    """A widget representing a single tentative schedule request with actions."""
+    
+    accept_requested = pyqtSignal(str, str) # event_id, caller_phone
+    reject_requested = pyqtSignal(str, str) # event_id, caller_phone
+
+    def __init__(self, event_data: dict, parent=None):
+        super().__init__(parent)
+        self.event_data = event_data
+        self.request_id = str(event_data.get('request_id', 'N/A'))
+        self.caller_phone = event_data.get('caller_phone', 'N/A')
+        
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self.setStyleSheet(f"""
+            QFrame {{
+                background-color: #1a1a1a; 
+                border: 1px solid #3c3c3c; 
+                border-radius: 6px; 
+                margin-bottom: 8px;
+            }}
+        """)
+        
+        layout = QVBoxLayout(self)
+        layout.setSpacing(5)
+        
+        summary = (
+            f"<b style='color:#ffffff;'>Time:</b> {self.format_timestamp(event_data.get('timestamp'))}<br>"
+            f"<b style='color:#e0e0e0;'>Caller:</b> {event_data.get('caller_name', 'Unknown')}<br>"
+            f"<b style='color:#e0e0e0;'>Reason:</b> {event_data.get('reason', 'N/A')}<br>"
+            f"<b style='color:#e0e0e0;'>Requested:</b> <i>{event_data.get('requested_time_str', 'N/A')}</i>"
+        )
+        self.summary_label = QLabel(summary)
+        self.summary_label.setWordWrap(True)
+        layout.addWidget(self.summary_label)
+
+        action_row = QHBoxLayout()
+        self.accept_btn = QPushButton("✅ Accept")
+        self.reject_btn = QPushButton("❌ Reject & Call")
+        
+        self.accept_btn.setStyleSheet("background-color: #2e8b57; color: white; padding: 5px;")
+        self.reject_btn.setStyleSheet("background-color: #b22222; color: white; padding: 5px;")
+        
+        self.accept_btn.clicked.connect(self._emit_accept)
+        self.reject_btn.clicked.connect(self._emit_reject)
+        
+        action_row.addWidget(self.accept_btn)
+        action_row.addWidget(self.reject_btn)
+        layout.addLayout(action_row)
+
+    def format_timestamp(self, utc_time_str):
+        try:
+            if utc_time_str.endswith("Z"):
+                dt_utc_naive = datetime.fromisoformat(utc_time_str.rstrip("Z"))
+                dt_utc = dt_utc_naive.replace(tzinfo=timezone.utc)
+            else:
+                dt_utc = datetime.fromisoformat(utc_time_str)
+                
+            dt_local = dt_utc.astimezone(LOCAL_TZ)
+            return dt_local.strftime("%I:%M %p") 
+        except Exception:
+            return "Time N/A"
+
+    def _emit_accept(self):
+        self.accept_requested.emit(self.request_id, self.caller_phone)
+        
+    def _emit_reject(self):
+        self.reject_requested.emit(self.request_id, self.caller_phone)
+
+
+class BookingAgentPage(QWidget):
+    def __init__(self, phone_number):
+        super().__init__()
+        self.phone_number = phone_number
+        self.all_requests = []
+        self.selected_event_id = None 
+        self.selected_event_caller_phone = None 
+    
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(30, 30, 30, 30)
+        main_layout.setSpacing(20)
+
+        # --- LEFT PANE ---
+        calendar_frame = QFrame()
+        calendar_frame.setFixedWidth(400)
+        calendar_frame.setStyleSheet(f"""
+                QFrame {{
+                    background-color: {PANEL_BLACK};
+                    border: 1px solid #2a2a2a;
+                    border-radius: 8px;
+                }}
+            """)
+        cal_layout = QVBoxLayout(calendar_frame)
+        cal_layout.setContentsMargins(15, 15, 15, 15)
+
+        title = QLabel("Select Date")
+        title.setFont(QFont("Segoe UI", 16, QFont.Weight.Bold))
+        title.setStyleSheet("color: #ffffff; margin-bottom: 10px;")
+        cal_layout.addWidget(title)
+
+        self.calendar = QCalendarWidget()
+        self.calendar.setStyleSheet(f"""
+                QCalendarWidget {{
+                    alternate-background-color: {BASE_BLACK};
+                    background-color: {PANEL_BLACK};
+                }}
+                QCalendarWidget QAbstractItemView {{
+                    color: {TEXT_MAIN};
+                    selection-background-color: {ACCENT_BLUE};
+                    selection-color: white;
+                }}
+                QCalendarWidget QToolButton {{
+                    color: {TEXT_MAIN};
+                    background-color: #2b2b2b;
+                }}
+            """)
+    
+        self.calendar.clicked.connect(self.filter_requests_by_date)
+        cal_layout.addWidget(self.calendar)
+        main_layout.addWidget(calendar_frame)
+
+        # --- RIGHT PANE ---
+        right_pane_layout = QVBoxLayout()
+        right_pane_layout.setContentsMargins(0, 0, 0, 0)
+        right_pane_layout.setSpacing(10)
+    
+        header_row = QHBoxLayout()
+        title_table = QLabel("Pending Requests (Tentative)")
+        title_table.setFont(QFont("Segoe UI", 22, QFont.Weight.Bold))
+        title_table.setStyleSheet("color: #ffffff;")
+        header_row.addWidget(title_table)
+        header_row.addStretch()
+    
+        self.pending_count_label = QLabel("0 PENDING")
+        self.pending_count_label.setStyleSheet("color: #ff6b6b; font-weight: 600; font-size: 16px;")
+        header_row.addWidget(self.pending_count_label)
+        right_pane_layout.addLayout(header_row)
+
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setStyleSheet(f"""
+                QScrollArea {{
+                    border: 1px solid #2a2a2a;
+                    border-radius: 8px;
+                    background-color: {PANEL_BLACK};
+                }}
+            """)
+
+        self.schedule_container = QWidget()
+        self.schedule_list_layout = QVBoxLayout(self.schedule_container)
+        self.schedule_list_layout.setAlignment(Qt.AlignmentFlag.AlignTop) 
+        self.schedule_container.setStyleSheet("padding: 10px;")
+
+        self.no_events_label = QLabel("Select a date to view tentative bookings.")
+        self.no_events_label.setStyleSheet("color: #a0a0a0; font-size: 14px; padding: 20px;")
+        self.schedule_list_layout.addWidget(self.no_events_label)
+
+        self.scroll_area.setWidget(self.schedule_container)
+        right_pane_layout.addWidget(self.scroll_area) 
+    
+        self.details_frame = QFrame()
+        self.details_frame.setStyleSheet("background-color: #1a1a1a; border-radius: 8px; padding: 15px;")
+        details_layout = QVBoxLayout(self.details_frame)
+    
+        self.event_label = QLabel("Select a tentative booking from the list above.")
+        self.event_label.setWordWrap(True)
+        self.event_label.setStyleSheet("font-size: 14px; color: #e0e0e0; margin-bottom: 10px;")
+        details_layout.addWidget(self.event_label)
+    
+        action_btn_row = QHBoxLayout()
+        self.accept_btn = QPushButton("✅ Accept & Confirm")
+        self.reject_btn = QPushButton("❌ Reject & Rebook (AI Call)")
+    
+        self.accept_btn.setStyleSheet("background-color: #2e8b57; color: white;")
+        self.reject_btn.setStyleSheet("background-color: #b22222; color: white;")
+    
+        self.accept_btn.setEnabled(False)
+        self.reject_btn.setEnabled(False)
+    
+        self.accept_btn.clicked.connect(self.accept_event)
+        self.reject_btn.clicked.connect(self.reject_event) 
+    
+        action_btn_row.addWidget(self.accept_btn)
+        action_btn_row.addWidget(self.reject_btn)
+        details_layout.addLayout(action_btn_row)
+        
+        right_pane_layout.addWidget(self.details_frame)
+        right_pane_layout.addStretch()
+
+        main_layout.addLayout(right_pane_layout)
+
+        self.timer = QTimer(self)
+        self.timer.timeout.connect(self.refresh_requests)
+        self.timer.start(15000) 
+        QTimer.singleShot(300, self.refresh_requests)
+
+    def filter_requests_by_date(self, date: QDate):
+        """Filters the self.all_requests data and RENDERs cards for the selected date."""
+        
+        while self.schedule_list_layout.count():
+            item = self.schedule_list_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+
+        target_date = datetime(date.year(), date.month(), date.day())
+        target_date_tz = target_date.replace(tzinfo=LOCAL_TZ)
+
+        events_found = 0
+        
+        for req in self.all_requests:
+            try:
+                timestamp_str = str(req.get('timestamp'))
+                if timestamp_str.endswith("Z"):
+                    dt_utc_naive = datetime.fromisoformat(timestamp_str.rstrip("Z"))
+                    dt_utc = dt_utc_naive.replace(tzinfo=timezone.utc)
+                else:
+                    dt_utc = datetime.fromisoformat(timestamp_str)
+                    
+                dt_local = dt_utc.astimezone(LOCAL_TZ)
+                
+                if dt_local.date() == target_date_tz.date():
+                    card = EventCard(req)
+                    card.accept_requested.connect(self.accept_event)
+                    card.reject_requested.connect(self.reject_event)
+                    self.schedule_list_layout.addWidget(card)
+                    events_found += 1
+            except Exception as e:
+                print(f"Rendering error on timestamp: {e}")
+
+        if events_found == 0:
+            self.no_events_label = QLabel(f"No tentative bookings found for {date.toString('MMM dd, yyyy')}.")
+            self.no_events_label.setStyleSheet("color: #a0a0a0; font-size: 14px; padding: 20px;")
+            self.schedule_list_layout.addWidget(self.no_events_label)
+            
+        self.schedule_list_layout.addStretch()
+
+    def accept_event(self, request_id=None, caller_phone=None):
+        # If buttons in list are clicked, they pass args. 
+        # If bottom detail buttons are clicked, use selected state.
+        if not request_id:
+            request_id = self.selected_event_id
+        if not request_id: return
+        QMessageBox.information(self, "Action", f"Accepting event ID: {request_id}. (Future: Confirmation sent to Outlook)")
+
+    def reject_event(self, request_id=None, caller_phone=None):
+        if not request_id:
+            request_id = self.selected_event_id
+            caller_phone = self.selected_event_caller_phone
+            
+        if not request_id or not caller_phone: return
+        
+        if QMessageBox.question(self, "Confirm Rejection", 
+                                f"Reject meeting and trigger AI callback to {caller_phone}?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No) == QMessageBox.StandardButton.Yes:
+            
+            def reject_logic():
+                url = f"{BASE_URL}/api/schedule/reject/{request_id}" 
+                payload = {"caller_phone": caller_phone}
+                r = requests.post(url, json=payload, timeout=15)
+                return r.ok
+            
+            worker = GenericRequestWorker(reject_logic)
+            worker.finished.connect(self.on_reject_complete)
+            worker.start()
+
+    def on_reject_complete(self, result):
+        if result is True:
+            QMessageBox.information(self, "Success", "Event rejected. AI callback initiated.")
+            self.refresh_requests()
+        else:
+            QMessageBox.warning(self, "Error", "Failed to reject event or start AI callback.")
+
+    def refresh_requests(self):
+        if not self.phone_number: return
+        self.pending_count_label.setText("...Checking")
+
+        def fetch_logic():
+            url = f"{BASE_URL}/api/schedule/requests/{self.phone_number}"
+            r = requests.get(url, timeout=5)
+            if r.ok:
+                return r.json()
+            return None
+
+        worker = GenericRequestWorker(fetch_logic)
+        worker.finished.connect(self.on_requests_fetched)
+        worker.start()
+        self.worker = worker
+
+    def on_requests_fetched(self, data):
+        if isinstance(data, list):
+            self.all_requests = data
+            count = len(data)
+            self.pending_count_label.setText(f"{count} PENDING")
+            if count > 0:
+                self.pending_count_label.setStyleSheet("color: #ff6b6b; font-weight: 600; font-size: 16px;")
+            else:
+                self.pending_count_label.setStyleSheet("color: #2e8b57; font-weight: 600; font-size: 16px;")
+            self.filter_requests_by_date(self.calendar.selectedDate())
+        else:
+            self.pending_count_label.setText("OFFLINE")
 
 
 # -----------------------------
@@ -946,8 +1264,6 @@ class CustomizeAIPage(QWidget):
     def __init__(self, phone_number):
         super().__init__()
         self.phone_number = phone_number
-        
-        # Separate workers to avoid collision
         self.load_worker = None
         self.save_worker = None
         
@@ -959,11 +1275,6 @@ class CustomizeAIPage(QWidget):
         title = QLabel("Agent Customization")
         title.setStyleSheet("font-size: 24px; font-weight: bold; color: #e0e0e0;")
         self.main_layout.addWidget(title)
-
-        display_number = self.phone_number if self.phone_number else "Unknown"
-        subtitle = QLabel(f"Editing AI for Number: {display_number}")
-        subtitle.setStyleSheet("font-size: 14px; color: #4da6ff; margin-bottom: 10px;")
-        self.main_layout.addWidget(subtitle)
 
         form_container = QFrame()
         form_container.setStyleSheet(f"""
@@ -980,7 +1291,6 @@ class CustomizeAIPage(QWidget):
         def create_section(label_text, placeholder, height=100):
             lbl = QLabel(label_text)
             lbl.setStyleSheet("color: #a0a0a0; font-weight: 600; font-size: 12px; text-transform: uppercase; letter-spacing: 1px;")
-            
             txt = QTextEdit()
             txt.setPlaceholderText(placeholder)
             txt.setFixedHeight(height)
@@ -1002,7 +1312,7 @@ class CustomizeAIPage(QWidget):
             return lbl, txt
 
         self.prompt_box_label, self.prompt_box = create_section(
-            "System Personality", 
+            "   Agent Personality (Recommended)", 
             "Define the agent's role, tone, and behavior constraints (e.g., 'You are a helpful receptionist named Lexi...')", 
             height=180
         )
@@ -1010,7 +1320,7 @@ class CustomizeAIPage(QWidget):
         form_layout.addWidget(self.prompt_box)
 
         self.greeting_box_label, self.greeting_box = create_section(
-            "Initial Greeting", 
+            "   Initial Greeting", 
             "What should the agent say immediately when the call connects? (e.g., 'Thanks for calling VerityLink, how can I help?')", 
             height=80
         )
@@ -1020,7 +1330,6 @@ class CustomizeAIPage(QWidget):
         self.main_layout.addWidget(form_container)
 
         action_layout = QHBoxLayout()
-        
         self.info_label = QLabel("")
         self.info_label.setStyleSheet("color: #2e8b57; font-weight: 500;")
 
@@ -1059,8 +1368,6 @@ class CustomizeAIPage(QWidget):
         if not self.phone_number:
             self.info_label.setText("Error: No phone number linked.")
             return
-            
-        # FIX: Check if loading already in progress
         if self.load_worker and self.load_worker.isRunning():
             return
 
@@ -1088,8 +1395,6 @@ class CustomizeAIPage(QWidget):
         if not self.phone_number:
             QMessageBox.warning(self, "Error", "No phone number associated with this account.")
             return
-            
-        # FIX: Check if save already in progress
         if self.save_worker and self.save_worker.isRunning():
             return
 
@@ -1121,7 +1426,7 @@ class CustomizeAIPage(QWidget):
         if isinstance(result, tuple):
             status_code, ok = result
             if ok:
-                self.info_label.setText("Settings Saved Successfully! ✅")
+                self.info_label.setText("Customization Saved Successfully!")
                 QTimer.singleShot(3000, lambda: self.info_label.setText(""))
             else:
                 self.info_label.setText(f"Save Failed: {status_code}")
@@ -1144,7 +1449,6 @@ class MainWindow(QWidget):
         self.phone_number = user_data.get("phone_number", "")
         self.license_key = user_data.get("license_key", "Unknown")
         
-        # FIX: Initialize worker attributes BEFORE calling init_ui
         self.status_worker = None 
         self.toggle_worker = None
         
@@ -1158,8 +1462,6 @@ class MainWindow(QWidget):
         self.sidebar_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
         self.sidebar_anim.finished.connect(self._on_sidebar_anim_finished)
         
-        # --- SYNC STATE ON STARTUP ---
-        # This fixes the issue where it says "OFF" even if it should be "ON"
         QTimer.singleShot(1000, self.check_server_state)
 
     def init_ui(self):
@@ -1167,7 +1469,6 @@ class MainWindow(QWidget):
         content_layout.setContentsMargins(0, 0, 0, 0)
         content_layout.setSpacing(0)
 
-        # --- Sidebar ---
         self.sidebar = QFrame()
         self.sidebar.setMinimumWidth(self.SIDEBAR_EXPANDED_WIDTH)
         self.sidebar.setMaximumWidth(self.SIDEBAR_EXPANDED_WIDTH)
@@ -1185,7 +1486,7 @@ class MainWindow(QWidget):
         sb.addWidget(self.toggle_side, alignment=Qt.AlignmentFlag.AlignLeft)
 
         self.btn_call = QPushButton("Call Agent")
-        self.btn_email = QPushButton("Email Agent")
+        self.btn_email = QPushButton("Booking")
         self.btn_draft = QPushButton("Customize AI")
         self.btn_about = QPushButton("About")
 
@@ -1210,28 +1511,27 @@ class MainWindow(QWidget):
             sb.addWidget(btn)
             
         self.btn_call.clicked.connect(lambda: self.stack.setCurrentWidget(self.call_page))
-        self.btn_email.clicked.connect(lambda: QMessageBox.information(self, "Email Agent", "Email Agent page not implemented yet."))
+        self.btn_email.clicked.connect(lambda: self.stack.setCurrentWidget(self.booking_page))
         self.btn_draft.clicked.connect(lambda: self.stack.setCurrentWidget(self.customize_page))
         self.btn_about.clicked.connect(lambda: self.stack.setCurrentWidget(self.about_page))
 
         sb.addStretch()
         content_layout.addWidget(self.sidebar)
 
-        # --- Pages ---
         self.stack = QStackedWidget()
         
         self.call_page = CallAgentPage(user_id=self.phone_number)
         self.call_page.phone_number = self.phone_number 
-        
+        self.booking_page = BookingAgentPage(self.phone_number)
         self.about_page = AboutPage(license_key=self.license_key)
         self.customize_page = CustomizeAIPage(self.phone_number)
         
         self.stack.addWidget(self.call_page)
+        self.stack.addWidget(self.booking_page)
         self.stack.addWidget(self.about_page)
         self.stack.addWidget(self.customize_page)
         content_layout.addWidget(self.stack, 1)
 
-        # --- Right Panel ---
         self.right_panel = QFrame()
         self.right_panel.setMinimumWidth(250)
         self.right_panel.setStyleSheet("background:#181818;")
@@ -1295,7 +1595,7 @@ class MainWindow(QWidget):
         tips_layout.addWidget(tips_header)
 
         tips_body = QLabel(
-            "If dashboard appears offline:\n"
+            "If the indicator appears offline:\n"
             "• Wait a few seconds, then refresh.\n"
             "• Check your internet connection.\n"
             "• Restart the dashboard if issue persists."
@@ -1320,7 +1620,6 @@ class MainWindow(QWidget):
         r.addWidget(QLabel("VerityLink, 2025", alignment=Qt.AlignmentFlag.AlignRight))
         content_layout.addWidget(self.right_panel)
 
-        # --- Welcome banner ---
         top_banner = QFrame()
         top_banner.setStyleSheet("background:#111; border: none;")
         top_banner.setFixedHeight(60)
@@ -1346,16 +1645,11 @@ class MainWindow(QWidget):
         if self.sidebar_expanded:
             self.sidebar_anim.setStartValue(self.SIDEBAR_EXPANDED_WIDTH)
             self.sidebar_anim.setEndValue(self.SIDEBAR_COLLAPSED_WIDTH)
-            
-            # During collapse, buttons remain visible and compress with the animation.
-            
             self.sidebar_anim.start()
             self.sidebar_expanded = False
         else:
-            # Show buttons before animation starts (for smooth expansion)
             for w in [self.btn_call, self.btn_email, self.btn_draft, self.btn_about]:
                 w.show()
-                
             self.sidebar_anim.setStartValue(self.SIDEBAR_COLLAPSED_WIDTH)
             self.sidebar_anim.setEndValue(self.SIDEBAR_EXPANDED_WIDTH)
             self.sidebar_anim.start()
@@ -1363,18 +1657,13 @@ class MainWindow(QWidget):
 
     def _on_sidebar_anim_finished(self):
         if not self.sidebar_expanded:
-            # Collapse finished. We must hide the buttons now to prevent interaction,
-            # but this happens AFTER the animation is visually complete.
             for w in [self.btn_call, self.btn_email, self.btn_draft, self.btn_about]:
                  w.hide()
-            
             self.sidebar.setMinimumWidth(self.SIDEBAR_COLLAPSED_WIDTH)
             self.sidebar.setMaximumWidth(self.SIDEBAR_COLLAPSED_WIDTH)
         else:
-            # Expansion finished. Ensure buttons are shown (done in toggle_sidebar too, but safe here)
             for w in [self.btn_call, self.btn_email, self.btn_draft, self.btn_about]:
                 w.show()
-                
             self.sidebar.setMinimumWidth(self.SIDEBAR_EXPANDED_WIDTH)
             self.sidebar.setMaximumWidth(self.SIDEBAR_EXPANDED_WIDTH)
 
@@ -1382,7 +1671,6 @@ class MainWindow(QWidget):
         self.main_layout.update()
         
     def check_server_state(self):
-        """Checks the actual status from the server on startup."""
         def task():
             try:
                 url = f"{SETTINGS_URL}/{self.phone_number}"
@@ -1390,7 +1678,6 @@ class MainWindow(QWidget):
                 if r.ok:
                     data = r.json()
                     is_active = data.get("active", False)
-                    # This line MUST match the function name below
                     self.set_toggle_ui(is_active)
             except Exception as e:
                 print(f"Failed to fetch initial state: {e}")
@@ -1398,15 +1685,9 @@ class MainWindow(QWidget):
         threading.Thread(target=task, daemon=True).start()
 
     def toggle_bot(self):
-        # Determine the target state (True = ON, False = OFF)
         target_state = self.toggle_btn.text() == "OFF"
-        
-        # Update UI immediately for responsiveness
         self.set_toggle_ui(target_state)
-        
-        # Send request in background with robust error handling
         threading.Thread(target=self._post_toggle, args=(target_state, self.phone_number), daemon=True).start()
-        
         
         def toggle_task(active):
             requests.post(TOGGLE_URL, json={"active": active}, timeout=5)
@@ -1415,59 +1696,46 @@ class MainWindow(QWidget):
         self.toggle_worker.start()
         
     def _post_toggle(self, state, phone_number):
-        """Sends the toggle command to the server with highly defensive exception handling."""
-        
-        # Use BaseException to catch lower-level errors that might crash the thread
         try:
             payload = {
                 "active": state,
                 "phone_number": phone_number
             }
             r = requests.post(TOGGLE_URL, json=payload, timeout=10)
-            
             if not r.ok:
-                # Log server-side issues
                 print(f"Toggle failed: Server responded with HTTP status code {r.status_code}. Response: {r.text[:100]}")
-                
         except requests.exceptions.RequestException as req_e:
-            # Catch specific network/connection problems (DNS, timeout, connection refused)
             print(f"Toggle failed: Network Error - Could not reach server. Details: {req_e}")
-            
         except BaseException as base_e:
-            # Catch all other critical system or thread errors
             print(f"Toggle failed: CRITICAL THREAD ERROR - {base_e}")
 
     def set_toggle_ui(self, on):
-        """Sets the visual state (color and text) of the ON/OFF button with hover effects."""
-        
         if on:
             self.toggle_btn.setText("ON")
-            # --- ON State Styling (Green) ---
             self.toggle_btn.setStyleSheet("""
                 QPushButton {
-                    background-color: #2e8b57; /* Sea Green */
+                    background-color: #2e8b57; 
                     color: white; 
                     font-weight: bold; 
                     border-radius: 8px; 
                     border: none;
                 }
                 QPushButton:hover {
-                    background-color: #257045; /* Slightly darker green on hover */
+                    background-color: #257045; 
                 }
             """)
         else:
             self.toggle_btn.setText("OFF")
-            # --- OFF State Styling (Red) ---
             self.toggle_btn.setStyleSheet("""
                 QPushButton {
-                    background-color: #b22222; /* Dark Red */
+                    background-color: #b22222; 
                     color: white; 
                     font-weight: bold; 
                     border-radius: 8px; 
                     border: none;
                 }
                 QPushButton:hover {
-                    background-color: #c23232; /* Slightly lighter red on hover */
+                    background-color: #c23232; 
                 }
             """)
 
@@ -1481,13 +1749,62 @@ class MainWindow(QWidget):
         self.status_worker.start()
 
 # -----------------------------
-# MAIN EXECUTION
+# GLOBAL STARTUP & EXECUTION
 # -----------------------------
+def start_login_process(app, startup):
+    """Proceeds to show the login dialog."""
+    login_dialog = LoginDialog()
+    if login_dialog.exec() == QDialog.DialogCode.Accepted:
+        main_window = MainWindow(user_data=login_dialog.user_data)
+        main_window.show()
+        startup.close()
+        app.main_window = main_window
+    else:
+        startup.close()
+        sys.exit(0)
+
+def handle_update_check_result(data, app, startup):
+    """Handles the result from the UpdateCheckWorker."""
+    if not data:
+        print("Warning: Could not fetch version data. Proceeding to login.")
+        start_login_process(app, startup)
+        return
+
+    latest_version = data.get("version", CURRENT_VERSION)
+    
+    if latest_version != CURRENT_VERSION:
+        changelog = data.get("changelog", "New features and fixes are available.")
+        dl_url = data.get("download_url", UPDATE_ZIP_URL)
+        
+        reply = QMessageBox.question(
+            startup, 
+            "Software Update Required",
+            f"A mandatory update ({latest_version}) is available!\n\nDetails:\n{changelog}\n\nDo you want to update now? The application will restart.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            download_and_install(dl_url)
+        else:
+            QMessageBox.information(startup, "Update Deferred", "You can proceed, but please update soon to access new features.", QMessageBox.StandardButton.Ok)
+            start_login_process(app, startup)
+    else:
+        start_login_process(app, startup)
+
+def proceed_to_login():
+    """Initiates the update check and then proceeds to login."""
+    global app, startup 
+
+    updater = UpdateCheckWorker()
+    updater.fetched.connect(lambda data: handle_update_check_result(data, app, startup))
+    updater.start()
+    app.updater_thread = updater 
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
     
     # --- SET APPLICATION ICON GLOBALLY ---
-    icon_path = resource_path("logo6.png")
+    icon_path = resource_path("logo.ico")
     if os.path.exists(icon_path):
         app_icon = QIcon(icon_path)
         app.setWindowIcon(app_icon)
@@ -1582,21 +1899,12 @@ if __name__ == "__main__":
     startup = StartupScreen()
     startup.resize(1100, 700)
     startup.show()
-
-    def proceed_to_login():
-        login_dialog = LoginDialog()
-        if login_dialog.exec() == QDialog.DialogCode.Accepted:
-            main_window = MainWindow(user_data=login_dialog.user_data)
-            main_window.show()
-            startup.close()
-            app.main_window = main_window
-        else:
-            startup.close()
-            sys.exit(0)
-
-    QTimer.singleShot(1500, proceed_to_login)
+    
+    QTimer.singleShot(1500, proceed_to_login) 
 
     sys.exit(app.exec())
+
+
 
 
 
