@@ -582,7 +582,7 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
                 
             messages.append({"role": role, "content": content})
 
-        # Add the current user input as the final message
+       # Add the current user input as the final message
         messages.append({"role": "user", "content": user_text})
 
         # --- CALL GROQ ---
@@ -594,43 +594,27 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
             max_tokens=150
         ))
 
-        # --- TOOL HANDLING LOGIC (Correctly placed INSIDE the try block) ---
+        # --- TOOL HANDLING LOGIC ---
         if completion.choices[0].message.tool_calls:
             tool_call = completion.choices[0].message.tool_calls[0]
-            func_name = tool_call.function.name
             
-            if func_name == "notify_user_of_schedule_request":
-                # Extract arguments from the LLM's tool call
-                try:
-                    args = json.loads(tool_call.function.arguments)
-                except json.JSONDecodeError as e:
-                    print(f"Error parsing tool arguments: {e}")
-                    return "<speak>I encountered an error processing your request. Could you please try again?</speak>"
-
-                # The system_number is the lawyer's phone number (from Twilio 'To' field)
-                lawyer_phone = fixed_caller_id
-                
-                # Save the request to the database
-                success = save_schedule_request_to_db(lawyer_phone, args)
-
-                if success:
-                    requested_time = args.get('requested_time_str', 'the time you specified')
-                    # Return final, conclusive AI response
-                    return f"<speak>Thank you. I have successfully logged your request for a meeting regarding <say-as interpret-as='reason'>{args.get('reason', 'your matter')}</say-as> at {requested_time}. The lawyer will follow up with you shortly.</speak>"
-                else:
-                    return "<speak>I apologize, I was unable to log the request at this moment. Could you please hold while I try again?</speak>"
+            # Call the synchronous tool handler and return its output immediately
+            tool_response_text = await call_tool_function(tool_call, fixed_caller_id)
+            
+            if tool_response_text:
+                # Return the AI's final confirmation and END the conversation here.
+                return tool_response_text
         
-        # --- STANDARD TEXT EXTRACTION (Only runs if NO tool call was made) ---
+        # --- STANDARD TEXT EXTRACTION (Only runs if NO tool call was made OR tool call failed to generate text) ---
 
         # Extract response text
         raw_response = completion.choices[0].message.content
         cleaned_response = re.sub(r'\s+', ' ', raw_response).strip()
 
         # --- REGEX CLEANING ---
-        # Ensure the response is wrapped in <speak> tags if Groq lost them
         if not cleaned_response.startswith("<speak>"):
              return f"<speak>{cleaned_response}</speak>"
-             
+            
         return cleaned_response
             
     except Exception as e:
@@ -753,6 +737,36 @@ def save_schedule_request_to_db(user_phone: str, args: dict) -> bool:
     finally:
         if conn:
             conn.close()
+
+
+async def call_tool_function(tool_call, lawyer_phone: str) -> Optional[str]:
+    """Routes the LLM's requested tool call to the corresponding Python function."""
+    func_name = tool_call.function.name
+    
+    try:
+        args = json.loads(tool_call.function.arguments)
+    except json.JSONDecodeError:
+        print("Error parsing tool arguments.")
+        return None
+
+    if func_name == "notify_user_of_schedule_request":
+        print(f"Executing tool: notify_user_of_schedule_request for {lawyer_phone}")
+        success = save_schedule_request_to_db(lawyer_phone, args)
+        
+        # Return the AI's final spoken confirmation immediately
+        if success:
+            requested_time = args.get('requested_time_str', 'the time you specified')
+            reason = args.get('reason', 'your matter')
+            
+            # This is the final spoken response
+            return f"<speak>Thank you. I have successfully logged your request for a meeting regarding <say-as interpret-as='reason'>{reason}</say-as> at {requested_time}. The lawyer will follow up with you shortly.</speak>"
+        else:
+            return "<speak>I apologize, I was unable to log the request at this moment. Please call back soon.</speak>"
+            
+    return None
+
+# --- END NEW HELPER FUNCTION ---
+
 # --- END NEW DATABASE FUNCTION ---
 
 # --- NEW ENDPOINT FOR TRANSCRIPT RETRIEVAL ---
