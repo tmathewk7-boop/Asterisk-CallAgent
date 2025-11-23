@@ -247,7 +247,7 @@ async def twilio_incoming(request: Request):
     # Log Call
     city = form.get("FromCity", "")
     location = f"{city}, {form.get('FromState', '')}" if city else "Unknown"
-    now_utc = datetime.datetime.utcnow().isoformat() + "Z"
+    now_utc = datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
     
     call_db[call_sid] = {
         "sid": call_sid,
