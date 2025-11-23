@@ -229,7 +229,6 @@ async def twilio_incoming(request: Request):
         # === AI OFF: CALL FORWARDING LOGIC ===
         print(f"AI is OFF for {system_number}. Forwarding call...")
         response = VoiceResponse()
-        return Response(content=str(response), media_type="application/xml")
         
         personal_phone = config.get("personal_phone")
         
