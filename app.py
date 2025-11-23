@@ -199,6 +199,30 @@ async def update_settings(settings: AgentSettings):
         if conn:
             conn.close()
 
+# --- ADD THIS TO YOUR FASTAPI BACKEND (app.py) ---
+
+@app.get("/api/schedule/requests/{user_phone}")
+async def get_schedule_requests(user_phone: str):
+    """Retrieves all PENDING schedule requests for the given lawyer."""
+    conn = get_db_connection()
+    if not conn:
+        return JSONResponse({"status": "error", "message": "Database unavailable"}, status_code=500)
+    try:
+        with conn.cursor() as cursor:
+            # Note: The status is hardcoded to 'PENDING' to show only new requests
+            sql = """
+                SELECT request_id, caller_name, caller_phone, requested_time_str, reason, timestamp
+                FROM schedule_requests 
+                WHERE user_phone = %s AND status = 'PENDING'
+                ORDER BY timestamp DESC
+            """
+            cursor.execute(sql, (user_phone,))
+            requests = cursor.fetchall()
+            return requests
+    finally:
+        if conn:
+            conn.close()
+
 @app.post("/toggle")
 async def toggle_agent(req: ToggleRequest):
     """Turn the AI ON or OFF in the Database."""
