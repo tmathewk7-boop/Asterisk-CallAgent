@@ -247,10 +247,11 @@ async def twilio_incoming(request: Request):
     # Log Call
     city = form.get("FromCity", "")
     location = f"{city}, {form.get('FromState', '')}" if city else "Unknown"
+    now_utc = datetime.datetime.utcnow().isoformat() + "Z"
     
     call_db[call_sid] = {
         "sid": call_sid,
-        "timestamp": datetime.datetime.now().strftime("%H:%M:%S"),
+        "timestamp": now_utc,
         "number": caller_number,
         "system_number": system_number,
         "client_name": caller_number,
@@ -574,7 +575,7 @@ def save_call_log_to_db(call_data: dict):
                 call_data.get('sid'),
                 call_data.get('number'),
                 call_data.get('system_number'),
-                datetime.datetime.now(),
+                datetime.datetime.utcnow(),
                 call_data.get('client_name'),
                 call_data.get('summary'),
                 call_data.get('full_transcript')
