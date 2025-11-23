@@ -405,6 +405,12 @@ async def generate_call_summary(call_sid: str):
     """Generates a short summary of the conversation history."""
     if not groq_client or call_sid not in transcripts: return
     full_text = "\n".join(transcripts[call_sid])
+    call_data = call_db.get(call_sid, {})
+    if not call_data: return
+    
+    call_data["full_transcript"] = full_text
+    save_call_log_to_db(call_data)
+    
     if not full_text: return
     try:
         loop = asyncio.get_running_loop()
@@ -554,6 +560,30 @@ async def extract_client_name(transcript: str, call_sid: str):
 
     except Exception as e:
         print(f"Error during name extraction: {e}")
+
+def save_call_log_to_db(call_data: dict):
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        with conn.cursor() as cursor:
+            sql = """
+                INSERT INTO calls (call_sid, phone_number, system_number, timestamp, client_name, summary, full_transcript)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """
+            cursor.execute(sql, (
+                call_data.get('sid'),
+                call_data.get('number'),
+                call_data.get('system_number'),
+                datetime.datetime.now(),
+                call_data.get('client_name'),
+                call_data.get('summary'),
+                call_data.get('full_transcript')
+            ))
+        conn.commit()
+    except Exception as e:
+        print(f"Error saving call log to DB: {e}")
+    finally:
+        if conn: conn.close()
 
 # --- NEW ENDPOINT FOR TRANSCRIPT RETRIEVAL ---
 @app.get("/api/transcripts/{call_sid}")
