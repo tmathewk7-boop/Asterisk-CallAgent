@@ -26,6 +26,29 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 PORT = int(os.getenv("PORT", 8000))
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://your-app.onrender.com")
+MS_CLIENT_ID = os.getenv("MS_CLIENT_ID", "YOUR_AZURE_CLIENT_ID")
+MS_CLIENT_SECRET = os.getenv("MS_CLIENT_SECRET", "YOUR_AZURE_CLIENT_SECRET")
+MS_REDIRECT_URI = f"{PUBLIC_URL}/outlook/auth-callback" 
+MS_AUTH_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+MS_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
+MS_GRAPH_URL = "https://graph.microsoft.com/v1.0"
+SCHEDULE_REQUEST_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "notify_user_of_schedule_request",
+        "description": "Collects the caller's full name, phone number, and requested meeting time/reason when they ask to schedule an appointment. This triggers a notification for the lawyer.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "caller_name": {"type": "string", "description": "The caller's full name."},
+                "caller_phone": {"type": "string", "description": "The caller's phone number, including country code."},
+                "requested_time_str": {"type": "string", "description": "The specific time/date the caller requested, kept as a raw string (e.g., 'next Tuesday at 3 PM')."},
+                "reason": {"type": "string", "description": "A brief reason for scheduling (e.g., 'case review', 'client intake')."}
+            },
+            "required": ["caller_name", "caller_phone", "requested_time_str"]
+        }
+    }
+}
 
 if GROQ_API_KEY:
     groq_client = Groq(api_key=GROQ_API_KEY)
@@ -516,7 +539,7 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
             f"for human-like conversational fluidity. Do not include the initial greeting."
         )
 
-        # --- CONSTRUCT MESSAGES ARRAY FROM HISTORY ---
+       # --- CONSTRUCT MESSAGES ARRAY FROM HISTORY ---
         messages = [{"role": "system", "content": ssml_prompt}]
         
         # Parse the context_history (e.g., "User: text" or "AI: text")
@@ -543,25 +566,52 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=messages,
             model="llama-3.1-8b-instant",
-            max_tokens=100
+            tools=[SCHEDULE_REQUEST_TOOL_SCHEMA],
+            max_tokens=150
         ))
+
+        # --- TOOL HANDLING LOGIC (Correctly placed INSIDE the try block) ---
+        if completion.choices[0].message.tool_calls:
+            tool_call = completion.choices[0].message.tool_calls[0]
+            func_name = tool_call.function.name
+            
+            if func_name == "notify_user_of_schedule_request":
+                # Extract arguments from the LLM's tool call
+                try:
+                    args = json.loads(tool_call.function.arguments)
+                except json.JSONDecodeError as e:
+                    print(f"Error parsing tool arguments: {e}")
+                    return "<speak>I encountered an error processing your request. Could you please try again?</speak>"
+
+                # The system_number is the lawyer's phone number (from Twilio 'To' field)
+                lawyer_phone = fixed_caller_id
+                
+                # Save the request to the database
+                success = save_schedule_request_to_db(lawyer_phone, args)
+
+                if success:
+                    requested_time = args.get('requested_time_str', 'the time you specified')
+                    # Return final, conclusive AI response
+                    return f"<speak>Thank you. I have successfully logged your request for a meeting regarding <say-as interpret-as='reason'>{args.get('reason', 'your matter')}</say-as> at {requested_time}. The lawyer will follow up with you shortly.</speak>"
+                else:
+                    return "<speak>I apologize, I was unable to log the request at this moment. Could you please hold while I try again?</speak>"
         
+        # --- STANDARD TEXT EXTRACTION (Only runs if NO tool call was made) ---
+
         # Extract response text
-        import re
         raw_response = completion.choices[0].message.content
         cleaned_response = re.sub(r'\s+', ' ', raw_response).strip()
-        
+
         # --- REGEX CLEANING ---
         # Ensure the response is wrapped in <speak> tags if Groq lost them
         if not cleaned_response.startswith("<speak>"):
-             return f"<speak>{cleaned_response}</speak>" 
-        
+                return f"<speak>{cleaned_response}</speak>" 
+            
         return cleaned_response
-        
+            
     except Exception as e:
         print(f"Groq generation failed: {e}")
         return "I apologize, I experienced a brief issue. Could you repeat that?"
-
 
 # Updated send_deepgram_tts signature
 async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str, call_sid: Optional[str] = None):
@@ -648,6 +698,38 @@ def save_call_log_to_db(call_data: dict):
         print(f"Error saving call log to DB: {e}")
     finally:
         if conn: conn.close()
+
+# --- ADD THIS NEW DATABASE FUNCTION ---
+def save_schedule_request_to_db(user_phone: str, args: dict) -> bool:
+    conn = get_db_connection()
+    if not conn:
+        print("DB Connection failed for schedule request.")
+        return False
+    try:
+        with conn.cursor() as cursor:
+            sql = """
+                INSERT INTO schedule_requests 
+                (user_phone, caller_name, caller_phone, requested_time_str, reason, status)
+                VALUES (%s, %s, %s, %s, %s, 'PENDING')
+            """
+            cursor.execute(sql, (
+                user_phone,
+                args.get('caller_name'),
+                args.get('caller_phone'),
+                args.get('requested_time_str'),
+                args.get('reason', 'Scheduling Request')
+            ))
+        conn.commit()
+        print(f"Schedule request saved for {user_phone}.")
+        return True
+    except Exception as e:
+        print(f"Error saving schedule request: {e}")
+        conn.rollback()
+        return False
+    finally:
+        if conn:
+            conn.close()
+# --- END NEW DATABASE FUNCTION ---
 
 # --- NEW ENDPOINT FOR TRANSCRIPT RETRIEVAL ---
 @app.get("/api/transcripts/{call_sid}")
