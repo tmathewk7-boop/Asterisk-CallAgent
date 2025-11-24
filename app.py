@@ -481,8 +481,11 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
         custom_prompt = config.get("system_prompt", "You are a helpful assistant.")
         fixed_caller_id = config.get("caller_id", "N/A") 
 
-        # Run name ion in background
-        asyncio.create_task(_client_name(transcript, call_sid))
+        # --- FIX: Run extraction, but don't assign to a variable that doesn't exist ---
+        # The function 'extract_client_name' saves directly to 'call_db', 
+        # so we don't need a return value here immediately.
+        asyncio.create_task(extract_client_name(transcript, call_sid))
+        # -----------------------------------------------------------------------------
         
         response_text = await generate_smart_response(transcript, custom_prompt, context_history, fixed_caller_id)
         transcripts[call_sid].append(f"AI: {response_text}")
@@ -493,15 +496,11 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
             tts_task_map[call_sid] = tts_task
             
             try:
-                await tts_task # Wait for it to finish (or be successfully cancelled)
+                await tts_task 
             except asyncio.CancelledError:
-                # --- CRITICAL FIX ---
-                # Task was successfully intercepted by the user's voice; treat as normal
                 print(f"[{call_sid}] TTS task successfully intercepted and cancelled.")
                 pass 
-            # --------------------
             
-            # Clear the task map once speech is finished/cancelled
             tts_task_map[call_sid] = None 
 
     except Exception as e:
