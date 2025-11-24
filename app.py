@@ -535,7 +535,21 @@ async def generate_call_summary(call_sid: str):
 async def transcribe_raw_audio(raw_ulaw):
     if not DEEPGRAM_API_KEY: return None
     try:
-        url = "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true&encoding=mulaw&sample_rate=8000"
+        # FIX: Added 'keywords' parameters to bias the ASR towards legal terms
+        # This makes it much less likely to hear "Wharf" instead of "Divorce"
+        url = (
+            "https://api.deepgram.com/v1/listen"
+            "?model=nova-2"
+            "&smart_format=true"
+            "&encoding=mulaw"
+            "&sample_rate=8000"
+            "&keywords=divorce:2"  # Boost 'divorce' priority
+            "&keywords=lawyer:2"
+            "&keywords=court:2"
+            "&keywords=legal:2"
+            "&keywords=custody:2"
+        )
+        
         headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "audio/basic"}
         async with httpx.AsyncClient() as client:
             response = await client.post(url, headers=headers, content=raw_ulaw)
@@ -602,15 +616,18 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
         
         # --- STANDARD TEXT ION (Only runs if NO tool call was made OR tool call failed to generate text) ---
 
-        #  response text
+        # Standard Text Extraction
         raw_response = completion.choices[0].message.content
         cleaned_response = re.sub(r'\s+', ' ', raw_response).strip()
 
-        # --- REGEX CLEANING ---
-        if not cleaned_response.startswith("<speak>"):
-             return f"<speak>{cleaned_response}</speak>"
-            
-        return cleaned_response
+        # FIX: Robust Tag Cleaning
+        # 1. If the AI included tags somewhere in the middle, strip them out to avoid nesting
+        if "<speak>" in cleaned_response:
+            # Remove existing tags so we can wrap it cleanly ourselves
+            cleaned_response = cleaned_response.replace("<speak>", "").replace("</speak>", "")
+
+        # 2. Now wrap the clean text in a single, valid pair of tags
+        return f"<speak>{cleaned_response}</speak>"
             
     except Exception as e:
         print(f"Groq generation failed: {e}")
