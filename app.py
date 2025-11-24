@@ -535,26 +535,27 @@ async def generate_call_summary(call_sid: str):
 async def transcribe_raw_audio(raw_ulaw):
     if not DEEPGRAM_API_KEY: return None
     try:
-        # FIX: Added 'keywords' parameters to bias the ASR towards legal terms
-        # This makes it much less likely to hear "Wharf" instead of "Divorce"
+        # KEYWORDS parameter biases the AI to hear legal terms instead of random words
         url = (
             "https://api.deepgram.com/v1/listen"
             "?model=nova-2"
             "&smart_format=true"
             "&encoding=mulaw"
             "&sample_rate=8000"
-            "&keywords=divorce:2"  # Boost 'divorce' priority
+            "&keywords=divorce:2"
             "&keywords=lawyer:2"
-            "&keywords=court:2"
             "&keywords=legal:2"
             "&keywords=custody:2"
+            "&keywords=court:2"
         )
         
         headers = {"Authorization": f"Token {DEEPGRAM_API_KEY}", "Content-Type": "audio/basic"}
         async with httpx.AsyncClient() as client:
             response = await client.post(url, headers=headers, content=raw_ulaw)
+        
         data = response.json()
-        if 'results' in data: return data['results']['channels'][0]['alternatives'][0]['transcript']
+        if 'results' in data: 
+            return data['results']['channels'][0]['alternatives'][0]['transcript']
         return None
     except Exception: return None
 
