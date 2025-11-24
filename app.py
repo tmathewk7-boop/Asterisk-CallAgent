@@ -639,42 +639,57 @@ async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str, call_sid:
     except Exception: 
         pass
 
+# --- REPLACE THIS FUNCTION IN app.py ---
+
 async def extract_client_name(transcript: str, call_sid: str):
-    """Uses Groq's low-latency API to extract and aggressively clean the caller's name."""
+    """Uses Groq's low-latency API to extract the caller's name, ignoring the lawyer's name."""
     if not groq_client or not transcript: return
 
+    # --- CONFIG: The Name to IGNORE ---
+    # Add the lawyer's name here so the AI never accidentally saves it as the client
+    LAWYER_NAME = "James" 
+    
     try:
         loop = asyncio.get_running_loop()
-        # Zero-shot prompt to extract the name
+        
+        # UPDATED PROMPT: Stricter rules to distinguish Caller vs. Lawyer
+        system_instruction = (
+            f"Analyze the transcript to find the CALLER'S name. "
+            f"Rules:\n"
+            f"1. IGNORE the name '{LAWYER_NAME}' or any variation (Jim, Jamie). That is the lawyer, not the caller.\n"
+            f"2. Only extract the name if the caller identifies THEMSELVES (e.g., 'This is Mike', 'My name is Sarah', 'It's John').\n"
+            f"3. If the caller only says 'I want to speak to {LAWYER_NAME}', return 'None'.\n"
+            f"4. Return ONLY the caller's full name. If not found, return 'None'."
+        )
+
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "Analyze the following transcript. Extract ONLY the caller's full name (First and Last). If no name is explicitly given, return ONLY the single, exact word 'None' (case-sensitive). Do not include any other text, apologies, or explanations."}, 
+                {"role": "system", "content": system_instruction}, 
                 {"role": "user", "content": transcript}
             ],
-            model="llama-3.1-8b-instant", max_tokens=15
+            model="llama-3.1-8b-instant", 
+            max_tokens=15
         ))
         
         extracted_name = completion.choices[0].message.content.strip()
 
-        # --- DEBUG POINT 1: Show Raw LLM Output ---
-        print(f"[{call_sid}] DEBUG: Raw LLM Name Output: '{extracted_name}'")
-        # ------------------------------------------
-
-        # Aggressively clean the extracted name
+        # --- CLEANING & VALIDATION ---
+        # Remove punctuation
         cleaned_name = extracted_name.replace('"', '').replace('.', '').strip()
         cleaned_name = ' '.join(word.capitalize() for word in cleaned_name.split())
 
-        # Check against 'None' and minimum length (to filter single letters/errors)
-        if cleaned_name.lower() != "none" and len(cleaned_name) > 3:
+        # Hard check: If the AI still returns "James", force it to None
+        if LAWYER_NAME.lower() in cleaned_name.lower():
+            print(f"[{call_sid}] CORRECTED: AI mistakenly extracted lawyer's name '{cleaned_name}'. Resetting to None.")
+            return # Do not save
+
+        # Save only if valid
+        if cleaned_name.lower() != "none" and len(cleaned_name) > 2:
             if call_sid in call_db:
                 call_db[call_sid]["client_name"] = cleaned_name
-                
-                # --- DEBUG POINT 2: Show Successful Save ---
-                print(f"[{call_sid}] SUCCESS: Name Updated in DB Memory to '{cleaned_name}'")
-                # ------------------------------------------
-                
+                print(f"[{call_sid}] SUCCESS: Name Updated in DB to '{cleaned_name}'")
         else:
-            print(f"[{call_sid}] FAIL: Name rejected. Cleaned name: '{cleaned_name}'.")
+            print(f"[{call_sid}] Name extraction skipped (Result: '{cleaned_name}')")
 
     except Exception as e:
         print(f"Error during name extraction: {e}")
