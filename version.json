@@ -1,6 +1,6 @@
 {
   "version": "1.0.0.2",
   "last_update": "2025-11-21",
-  "changelog": "Fixed sidebar crash.\nAdded hover effects to buttons.",
-  "download_url": "https://github.com/tmathewk7-boop/Asterisk-CallAgent/edit/main/update.zip"
+  "changelog": "Testing update.\lets see if this works.",
+  "download_url": "https://raw.githubusercontent.com/tmathewk7-boop/Asterisk-CallAgent/main/update.zip"
 }
