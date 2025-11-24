@@ -273,17 +273,13 @@ async def twilio_incoming(request: Request):
     is_active = config.get("ai_active", True)
     
     if not is_active:
-        # === AI OFF: CALL FORWARDING LOGIC ===
-        print(f"AI is OFF for {system_number}. Forwarding call...")
+        # === AI OFF: SIMULTANEOUS RING LOGIC ===
+        print(f"AI is OFF for {system_number}. Rejecting call so Desk Phone keeps ringing.")
         response = VoiceResponse()
         
-        personal_phone = config.get("personal_phone")
-        
-        if personal_phone:
-            response.say("Connecting you to the user.")
-            response.dial(personal_phone)
-        else:
-            response.say("The person you are calling is unavailable and has not set a forwarding number.")
+        # <Reject> tells the carrier "I'm busy, try the other phone."
+        # This allows the Simultaneous Ring to continue on the Desk Phone.
+        response.reject() 
             
         return Response(content=str(response), media_type="application/xml")
 
