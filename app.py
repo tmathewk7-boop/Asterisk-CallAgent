@@ -481,8 +481,8 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
         custom_prompt = config.get("system_prompt", "You are a helpful assistant.")
         fixed_caller_id = config.get("caller_id", "N/A") 
 
-        # Run name extraction in background
-        asyncio.create_task(extract_client_name(transcript, call_sid))
+        # Run name ion in background
+        asyncio.create_task(_client_name(transcript, call_sid))
         
         response_text = await generate_smart_response(transcript, custom_prompt, context_history, fixed_caller_id)
         transcripts[call_sid].append(f"AI: {response_text}")
@@ -586,10 +586,10 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=messages,
             model="llama-3.1-8b-instant",
-            tools=[SCHEDULE_REQUEST_TOOL_SCHEMA],
+            # tools=[SCHEDULE_REQUEST_TOOL_SCHEMA],  <-- MAKE SURE THIS IS COMMENTED OUT
             max_tokens=150
         ))
-
+        
         # --- TOOL HANDLING LOGIC ---
         if completion.choices[0].message.tool_calls:
             tool_call = completion.choices[0].message.tool_calls[0]
@@ -601,9 +601,9 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
                 # Return the AI's final confirmation and END the conversation here.
                 return tool_response_text
         
-        # --- STANDARD TEXT EXTRACTION (Only runs if NO tool call was made OR tool call failed to generate text) ---
+        # --- STANDARD TEXT ION (Only runs if NO tool call was made OR tool call failed to generate text) ---
 
-        # Extract response text
+        #  response text
         raw_response = completion.choices[0].message.content
         cleaned_response = re.sub(r'\s+', ' ', raw_response).strip()
 
@@ -642,24 +642,23 @@ async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str, call_sid:
 # --- REPLACE THIS FUNCTION IN app.py ---
 
 async def extract_client_name(transcript: str, call_sid: str):
-    """Uses Groq's low-latency API to extract the caller's name, ignoring the lawyer's name."""
+    """Extracts the caller's name with strict filtering to prevent AI chat."""
     if not groq_client or not transcript: return
 
-    # --- CONFIG: The Name to IGNORE ---
-    # Add the lawyer's name here so the AI never accidentally saves it as the client
-    LAWYER_NAME = "James" 
+    LAWYER_NAME = "Chris"  # Update this to the actual lawyer's name
     
     try:
         loop = asyncio.get_running_loop()
         
-        # UPDATED PROMPT: Stricter rules to distinguish Caller vs. Lawyer
+        # STRICT PROMPT: Force JSON-like brevity
         system_instruction = (
-            f"Analyze the transcript to find the CALLER'S name. "
-            f"Rules:\n"
-            f"1. IGNORE the name '{LAWYER_NAME}' or any variation (Jim, Jamie). That is the lawyer, not the caller.\n"
-            f"2. Only extract the name if the caller identifies THEMSELVES (e.g., 'This is Mike', 'My name is Sarah', 'It's John').\n"
-            f"3. If the caller only says 'I want to speak to {LAWYER_NAME}', return 'None'.\n"
-            f"4. Return ONLY the caller's full name. If not found, return 'None'."
+            "You are a precise data extraction engine. You are NOT a chatbot. "
+            "Your ONLY task is to output the caller's full name from the transcript. "
+            "Rules:\n"
+            f"1. If the name is '{LAWYER_NAME}' or refers to the lawyer, return 'None'.\n"
+            "2. If the name is not clearly stated by the caller, return 'None'.\n"
+            "3. Do NOT output sentences like 'Here is the name'. Output ONLY the name.\n"
+            "4. Ignore phrases like 'My name is'. Just return the name itself."
         )
 
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
@@ -668,28 +667,30 @@ async def extract_client_name(transcript: str, call_sid: str):
                 {"role": "user", "content": transcript}
             ],
             model="llama-3.1-8b-instant", 
-            max_tokens=15
+            max_tokens=10, # Extremely low token limit cuts off long hallucinations
+            temperature=0.1 # Low temperature for deterministic output
         ))
         
         extracted_name = completion.choices[0].message.content.strip()
 
-        # --- CLEANING & VALIDATION ---
-        # Remove punctuation
+        # --- VALIDATION FILTERS ---
+        # 1. Reject if it looks like a sentence
+        if len(extracted_name.split()) > 4 or "transcript" in extracted_name.lower():
+            print(f"[{call_sid}] REJECTED BAD NAME: '{extracted_name}'")
+            return
+
+        # 2. Cleaning
         cleaned_name = extracted_name.replace('"', '').replace('.', '').strip()
         cleaned_name = ' '.join(word.capitalize() for word in cleaned_name.split())
 
-        # Hard check: If the AI still returns "James", force it to None
+        # 3. Final Checks
         if LAWYER_NAME.lower() in cleaned_name.lower():
-            print(f"[{call_sid}] CORRECTED: AI mistakenly extracted lawyer's name '{cleaned_name}'. Resetting to None.")
-            return # Do not save
+            return 
 
-        # Save only if valid
         if cleaned_name.lower() != "none" and len(cleaned_name) > 2:
             if call_sid in call_db:
                 call_db[call_sid]["client_name"] = cleaned_name
-                print(f"[{call_sid}] SUCCESS: Name Updated in DB to '{cleaned_name}'")
-        else:
-            print(f"[{call_sid}] Name extraction skipped (Result: '{cleaned_name}')")
+                print(f"[{call_sid}] SUCCESS: Name Updated to '{cleaned_name}'")
 
     except Exception as e:
         print(f"Error during name extraction: {e}")
