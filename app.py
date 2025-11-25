@@ -40,9 +40,7 @@ MS_GRAPH_URL = "https://graph.microsoft.com/v1.0"
 # --- FIRM DIRECTORY ---
 # Keys must be lowercase single names
 FIRM_DIRECTORY = {
-    "james": "+14037757197", 
-    "chris": "+14037757197", 
-    "reception": "+14037757197"
+    "james": "+13065183350"
 }
 
 # --- TOOLS ---
