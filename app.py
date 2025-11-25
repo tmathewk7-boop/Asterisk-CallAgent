@@ -561,30 +561,29 @@ async def handle_complete_sentence(call_sid: str, stream_sid: str, raw_ulaw: byt
         custom_prompt = config.get("system_prompt", "You are a helpful assistant.")
         fixed_caller_id = config.get("caller_id", "N/A") 
 
-        # --- FIX: Run extraction, but don't assign to a variable that doesn't exist ---
-        # The function 'extract_client_name' saves directly to 'call_db', 
-        # so we don't need a return value here immediately.
+        # Non-blocking name extraction
         asyncio.create_task(extract_client_name(transcript, call_sid))
-        # -----------------------------------------------------------------------------
         
-        response_text = await generate_smart_response(transcript, custom_prompt, context_history, fixed_caller_id)
+        # --- FIX: Added 'call_sid' as the final argument here ---
+        response_text = await generate_smart_response(transcript, custom_prompt, context_history, fixed_caller_id, call_sid)
+        # -------------------------------------------------------
+
         transcripts[call_sid].append(f"AI: {response_text}")
         
         ws = media_ws_map.get(call_sid)
         if ws:
             tts_task = asyncio.create_task(send_deepgram_tts(ws, stream_sid, response_text, call_sid))
             tts_task_map[call_sid] = tts_task
-            
             try:
                 await tts_task 
             except asyncio.CancelledError:
-                print(f"[{call_sid}] TTS task successfully intercepted and cancelled.")
                 pass 
-            
             tts_task_map[call_sid] = None 
 
     except Exception as e:
         print(f"Error in handle_complete_sentence: {e}")
+
+        
 # ---------------- Helpers ----------------
 async def generate_call_summary(call_sid: str):
     """Generates a short summary of the conversation history."""
