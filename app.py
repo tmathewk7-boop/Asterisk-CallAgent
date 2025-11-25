@@ -203,15 +203,18 @@ async def transfer_failed(request: Request):
         save_schedule_request_to_db(lawyer_main_phone, request_args)
         print(f"[{call_sid}] Auto-logged missed transfer: {fail_reason}")
 
-    # Play apology to caller (since we hid the real voicemail from them)
+    # ... inside transfer_failed ...
+
+    # FIX: Added voice='Polly.Joanna-Neural' here too
     twiml = f"""
     <Response>
-        <Say>I apologize, but {target_name} is currently unavailable.</Say>
-        <Say>I have notified them that you called, and they will return your call shortly. Goodbye.</Say>
+        <Say voice="Polly.Joanna-Neural">I apologize, but {target_name} is currently unavailable.</Say>
+        <Say voice="Polly.Joanna-Neural">I have notified them that you called, and they will return your call shortly. Goodbye.</Say>
         <Hangup/>
     </Response>
     """
     return Response(content=twiml, media_type="application/xml")
+    
 @app.get("/api/calls/{target_number}")
 async def get_calls_for_client(target_number: str):
     """Returns calls only for the specific phone number."""
@@ -729,9 +732,10 @@ async def execute_transfer(json_args, call_sid):
             # FIX: Added answerOnBridge="true" and machineDetection="Enable"
             # answerOnBridge="true": Caller hears Twilio ringing/music, NOT the raw phone line audio (masks voicemail greeting).
             # machineDetection="Enable": Twilio listens for a robot voice.
+            # FIX: Added voice='Polly.Joanna-Neural' to match a high-quality AI persona
             transfer_twiml = f"""
                 <Response>
-                    <Say>Please hold while I connect you to {target_name.capitalize()}.</Say>
+                    <Say voice="Polly.Joanna-Neural">Please hold while I connect you to {target_name.capitalize()}.</Say>
                     <Dial action="{callback_url}" 
                           timeout="20" 
                           answerOnBridge="true" 
