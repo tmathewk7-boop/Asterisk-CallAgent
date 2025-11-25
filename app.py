@@ -389,7 +389,7 @@ async def media_ws_endpoint(ws: WebSocket):
     finally:
         if call_sid:
             if call_sid in call_db: call_db[call_sid]["status"] = "Ended"
-            asyncio.create_task(call_summary(call_sid))
+            asyncio.create_task(generate_call_summary(call_sid))
             if call_sid in media_ws_map: del media_ws_map[call_sid]
             if call_sid in full_sentence_buffer: del full_sentence_buffer[call_sid]
             if call_sid in active_call_config: del active_call_config[call_sid]
@@ -426,7 +426,7 @@ async def handle_complete_sentence(call_sid, stream_sid, audio):
         
         config = active_call_config.get(call_sid, DEFAULT_CONFIG)
         
-        response_text = await smart_response(
+        response_text = await generate_smart_response(
             transcript, 
             config.get("system_prompt", "You are a helpful assistant."), 
             transcripts[call_sid][-10:], 
