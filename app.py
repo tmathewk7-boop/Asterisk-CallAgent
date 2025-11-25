@@ -191,6 +191,10 @@ class DeleteCallsRequest(BaseModel):
 
 @app.post("/twilio/transfer-failed")
 async def transfer_failed(request: Request):
+    """
+    Handles failed transfers (busy/no-answer).
+    Restores the AI's config and reconnects the caller so the AI can take a message.
+    """
     form = await request.form()
     call_sid = form.get("CallSid")
     dial_status = form.get("DialCallStatus")
@@ -198,12 +202,34 @@ async def transfer_failed(request: Request):
 
     print(f"[{call_sid}] Transfer Status: {dial_status}")
 
+    # If successful, hang up (call is done)
     if dial_status == "completed":
         return Response(content="<Response><Hangup/></Response>", media_type="application/xml")
 
+    # --- RESTORE BRAIN (The Critical Fix) ---
+    # 1. Get the lawyer's phone number from the call history
     call_data = call_db.get(call_sid)
+    lawyer_main_phone = ""
     if call_data:
         lawyer_main_phone = call_data.get("system_number")
+        # Reset status to Live so the dashboard knows it's active again
+        call_db[call_sid]["status"] = "Live" 
+
+    # 2. Re-load the user's settings from the database
+    # (Because the transfer cleared the previous active_call_config)
+    config = get_user_settings(lawyer_main_phone)
+    config = {**DEFAULT_CONFIG, **config}
+    
+    # 3. FORCE the Apology Greeting
+    # This ensures the AI says "I apologize..." instead of "Hello..."
+    apology_msg = f"I apologize, but {target_name} is currently unavailable. May I have your name so they can return your call?"
+    config["greeting"] = apology_msg
+    
+    # 4. Save back to active memory
+    active_call_config[call_sid] = config
+
+    # --- LOG THE MISS ---
+    if call_data:
         request_args = {
             "caller_name": call_data.get("client_name", "Unknown Caller"),
             "caller_phone": call_data.get("number", "Unknown"),
@@ -212,16 +238,18 @@ async def transfer_failed(request: Request):
         }
         save_schedule_request_to_db(lawyer_main_phone, request_args)
 
-    if call_sid in active_call_config:
-        # Force apology greeting on reconnect
-        active_call_config[call_sid]["greeting"] = f"I apologize, but {target_name} is currently unavailable. May I have your name so they can return your call?"
-    
+    # --- RECONNECT STREAM ---
     host = PUBLIC_URL.replace("https://", "wss://").replace("http://", "ws://")
     stream_url = f"{host}/media-ws"
     
-    twiml = f"""<Response><Connect><Stream url="{stream_url}" /></Connect></Response>"""
+    twiml = f"""
+    <Response>
+        <Connect>
+            <Stream url="{stream_url}" />
+        </Connect>
+    </Response>
+    """
     return Response(content=twiml, media_type="application/xml")
-
 @app.post("/api/schedule/reject/{request_id}")
 async def reject_schedule_request(request_id: int, payload: dict):
     conn = get_db_connection()
