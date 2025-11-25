@@ -40,9 +40,7 @@ MS_GRAPH_URL = "https://graph.microsoft.com/v1.0"
 # --- FIRM DIRECTORY ---
 # Keys must be lowercase single names
 FIRM_DIRECTORY = {
-    "james": "+14037757197", 
-    "chris": "+14037757197", 
-    "reception": "+14037757197"
+    "james": "+13065183350"
 }
 
 # --- TOOLS ---
@@ -475,8 +473,8 @@ async def execute_transfer(json_args, call_sid):
             print(f"[{call_sid}] EXECUTING TRANSFER -> {target_name}")
             callback_url = f"{PUBLIC_URL}/twilio/transfer-failed?target={target_name}"
             
-            # SILENT TRANSFER: We rely on Twilio to play ring tones (answerOnBridge=true)
-            # We DO NOT use <Say> here to avoid robot voice mismatch.
+            # SILENT TRANSFER: No <Say> here. We let the AI speak the confirmation, then Twilio just dials.
+            # This prevents the "Robot Voice" from interrupting.
             twiml = f"""
                 <Response>
                     <Dial action="{callback_url}" timeout="20" answerOnBridge="true" machineDetection="Enable">
@@ -485,8 +483,9 @@ async def execute_transfer(json_args, call_sid):
                 </Response>
             """
             twilio_rest_client.calls(call_sid).update(twiml=twiml)
-            # Deepgram Voice speaks this before the transfer kicks in
-            return "<speak>One moment, transferring you now.</speak>"
+            
+            # FIX: Updated the spoken phrase to match your request exactly
+            return f"<speak>Perfect. I'll transfer your call to {target_name.capitalize()}.</speak>"
         else:
             return "<speak>I apologize, but I cannot connect you at this time. May I take a message?</speak>"
     except Exception as e:
