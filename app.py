@@ -79,7 +79,7 @@ else:
 # --- FIRM DIRECTORY (Who can receive calls?) ---
 # Update these with REAL numbers (E.164 format: +1...)
 FIRM_DIRECTORY = {
-    "James (Real Estate)": "+14037757197",  
+    "James": "+14037757197",  
 }
 
 if GROQ_API_KEY:
@@ -709,6 +709,13 @@ async def execute_transfer(json_args, call_sid):
         target_name = args.get("person_name", "").lower()
         target_number = FIRM_DIRECTORY.get(target_name)
         
+        # --- DEBUGGING PRINTS ---
+        if not target_number:
+            print(f"[{call_sid}] TRANSFER FAILED: Name '{target_name}' not found in FIRM_DIRECTORY.")
+        if not twilio_rest_client:
+            print(f"[{call_sid}] TRANSFER FAILED: Twilio Client is None. Check environment variables.")
+        # ------------------------
+
         if target_number and twilio_rest_client:
             print(f"[{call_sid}] EXECUTING TRANSFER -> {target_name} ({target_number})")
             
@@ -722,10 +729,13 @@ async def execute_transfer(json_args, call_sid):
             twilio_rest_client.calls(call_sid).update(twiml=transfer_twiml)
             return "<speak>Transferring you now.</speak>"
         else:
-            return "<speak>I apologize, but I don't have a number for that person.</speak>"
+            # This is what the caller hears if the setup fails
+            return "<speak>I apologize, but I am unable to connect the call due to a technical configuration error.</speak>"
+            
     except Exception as e:
         print(f"Transfer Execution Error: {e}")
         return "<speak>I am having trouble connecting you.</speak>"
+        
 # Updated send_deepgram_tts signature
 async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str, call_sid: Optional[str] = None):
     if not DEEPGRAM_API_KEY: return
