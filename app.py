@@ -491,7 +491,10 @@ async def generate_smart_response(user_text, system_prompt, history, caller_id, 
 
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
-            messages=messages, model="llama-3.1-8b-instant", tools=[TRANSFER_TOOL_SCHEMA], max_tokens=150
+            messages=messages,
+            model="llama-3.1-8b-instant",
+            tools=[TRANSFER_TOOL_SCHEMA], 
+            max_tokens=150
         ))
 
         # 1. Check for Tool Call
@@ -510,8 +513,14 @@ async def generate_smart_response(user_text, system_prompt, history, caller_id, 
         return f"<speak>{clean}</speak>"
 
     except Exception as e:
-        print(f"Groq Error: {e}")
-        return "I apologize, I am having trouble answering."
+        # FIX: specific logging for the "brave_search" or 400 errors
+        error_str = str(e)
+        if "400" in error_str and "tool" in error_str:
+            print(f"[{call_sid}] AI attempted invalid tool use (Hallucination blocked).")
+            return "<speak>I apologize, could you please repeat that?</speak>"
+            
+        print(f"Groq generation failed: {e}")
+        return "I apologize, I experienced a brief issue."
 
 # --- EXTRACT & SUMMARIZE ---
 async def extract_client_name(transcript, call_sid):
