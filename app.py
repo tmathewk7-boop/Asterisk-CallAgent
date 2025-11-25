@@ -673,7 +673,7 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
         if completion.choices[0].message.tool_calls:
             tool_call = completion.choices[0].message.tool_calls[0]
             if tool_call.function.name == "transfer_call":
-                return await _transfer(tool_call.function.arguments, call_sid)
+                return await execute_transfer(tool_call.function.arguments, call_sid)
 
         # --- 2. CHECK FOR HALLUCINATED TOOL CALLS (The Fix) ---
         raw_response = completion.choices[0].message.content
@@ -685,7 +685,7 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
         if match:
             print(f"[{call_sid}] CAUGHT HALLUCINATED TRANSFER: {match.group(1)}")
             json_args = match.group(1).strip()
-            return await _transfer(json_args, call_sid)
+            return await execute_transfer(json_args, call_sid)
 
         # --- 3. STANDARD TEXT CLEANING (If no transfer) ---
         cleaned_response = re.sub(r'\s+', ' ', raw_response).strip()
