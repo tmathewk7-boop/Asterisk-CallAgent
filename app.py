@@ -642,7 +642,7 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
     if not groq_client: return "I apologize, I experienced a brief issue."
     
     try:
-        # ... (Previous SSML and Message setup remains the same) ...
+        # ... (Keep your existing setup code) ...
         cleaned_digits = fixed_caller_id.lstrip('+').lstrip('1') 
         ssml_fixed_caller_id = f'<say-as interpret-as="characters">{cleaned_digits}</say-as>'
         ssml_prompt = (
@@ -651,63 +651,81 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
         )
 
         messages = [{"role": "system", "content": ssml_prompt}]
-        # ... (Add history loop here as before) ...
+        for line in context_history:
+            if line.startswith("User:"):
+                messages.append({"role": "user", "content": line[5:].strip()})
+            elif line.startswith("AI:"):
+                messages.append({"role": "assistant", "content": line[3:].strip()})
+        
         messages.append({"role": "user", "content": user_text})
 
-        # --- CALL GROQ (With Transfer Tool Enabled) ---
+        # --- CALL GROQ ---
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=messages,
             model="llama-3.1-8b-instant",
-            
-            # CRITICAL FIX: Uncomment this and add TRANSFER_TOOL_SCHEMA
             tools=[TRANSFER_TOOL_SCHEMA], 
-            
             max_tokens=150
         ))
 
-        # --- TOOL HANDLING LOGIC ---
+        # --- 1. CHECK FOR PROPER TOOL CALLS (Standard Way) ---
         if completion.choices[0].message.tool_calls:
             tool_call = completion.choices[0].message.tool_calls[0]
-            func_name = tool_call.function.name
-            
-            if func_name == "transfer_call":
-                args = json.loads(tool_call.function.arguments)
-                target_name = args.get("person_name", "").lower()
-                target_number = FIRM_DIRECTORY.get(target_name)
-                
-                if target_number and twilio_rest_client:
-                    print(f"[{call_sid}] TRANSFERRING -> {target_name}")
-                    
-                    # --- THE BOOMERANG FIX ---
-                    # We add 'action' to the Dial verb.
-                    # If the call is NOT completed (busy/no-answer), Twilio hits this URL.
-                    # We pass the target_name in the query string so we know who missed the call.
-                    callback_url = f"{PUBLIC_URL}/twilio/transfer-failed?target={target_name}"
-                    
-                    transfer_twiml = f"""
-                        <Response>
-                            <Say>Please hold while I connect you to {target_name.capitalize()}.</Say>
-                            <Dial action="{callback_url}" timeout="20">{target_number}</Dial>
-                        </Response>
-                    """
-                    twilio_rest_client.calls(call_sid).update(twiml=transfer_twiml)
-                    return "<speak>Transferring you now.</speak>"
-                else:
-                    # Fallback if name not found or Client missing
-                    return "<speak>I apologize, but I don't have a number for that person. Is there someone else?</speak>"
+            if tool_call.function.name == "transfer_call":
+                return await execute_transfer(tool_call.function.arguments, call_sid)
 
-        # Standard Text Extraction (Fallback if no tool called)
+        # --- 2. CHECK FOR HALLUCINATED TOOL CALLS (The Fix) ---
         raw_response = completion.choices[0].message.content
+        
+        # Regex to find <function=transfer_call>{...}</function>
+        hallucination_pattern = r"<function=transfer_call>(.*?)</function>"
+        match = re.search(hallucination_pattern, raw_response, re.DOTALL)
+        
+        if match:
+            print(f"[{call_sid}] CAUGHT HALLUCINATED TRANSFER: {match.group(1)}")
+            json_args = match.group(1).strip()
+            return await execute_transfer(json_args, call_sid)
+
+        # --- 3. STANDARD TEXT CLEANING (If no transfer) ---
         cleaned_response = re.sub(r'\s+', ' ', raw_response).strip()
+        
+        # Clean out any broken function tags just in case
+        cleaned_response = re.sub(r"<function.*?>.*?</function>", "", cleaned_response)
+        
         if "<speak>" in cleaned_response:
             cleaned_response = cleaned_response.replace("<speak>", "").replace("</speak>", "")
+            
         return f"<speak>{cleaned_response}</speak>"
             
     except Exception as e:
         print(f"Groq generation failed: {e}")
         return "I apologize, I experienced a brief issue."
 
+# --- NEW HELPER FUNCTION TO AVOID DUPLICATE LOGIC ---
+async def execute_transfer(json_args, call_sid):
+    """Parses args and executes the Twilio transfer."""
+    try:
+        args = json.loads(json_args)
+        target_name = args.get("person_name", "").lower()
+        target_number = FIRM_DIRECTORY.get(target_name)
+        
+        if target_number and twilio_rest_client:
+            print(f"[{call_sid}] EXECUTING TRANSFER -> {target_name} ({target_number})")
+            
+            callback_url = f"{PUBLIC_URL}/twilio/transfer-failed?target={target_name}"
+            transfer_twiml = f"""
+                <Response>
+                    <Say>Please hold while I connect you to {target_name.capitalize()}.</Say>
+                    <Dial action="{callback_url}" timeout="20">{target_number}</Dial>
+                </Response>
+            """
+            twilio_rest_client.calls(call_sid).update(twiml=transfer_twiml)
+            return "<speak>Transferring you now.</speak>"
+        else:
+            return "<speak>I apologize, but I don't have a number for that person.</speak>"
+    except Exception as e:
+        print(f"Transfer Execution Error: {e}")
+        return "<speak>I am having trouble connecting you.</speak>"
 # Updated send_deepgram_tts signature
 async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str, call_sid: Optional[str] = None):
     if not DEEPGRAM_API_KEY: return
