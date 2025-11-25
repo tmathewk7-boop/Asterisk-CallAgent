@@ -472,7 +472,7 @@ async def execute_transfer(json_args, call_sid):
             # The AI says "Transferring" before the switch happens (using Deepgram voice)
             return "<speak>Transferring you now.</speak>"
         else:
-            return "<speak>I apologize, but I cannot connect you at this time.</speak>"
+            return "<speak>I apologize, but I cannot connect you to James right now. Would you like to leave a message for him?</speak>"
     except Exception as e:
         print(f"Transfer Error: {e}")
         return "<speak>I am having trouble transferring you.</speak>"
