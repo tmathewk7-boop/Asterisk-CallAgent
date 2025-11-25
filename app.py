@@ -40,7 +40,9 @@ MS_GRAPH_URL = "https://graph.microsoft.com/v1.0"
 # --- FIRM DIRECTORY ---
 # Keys must be lowercase single names
 FIRM_DIRECTORY = {
-    "james": "+13065183350"
+    "james": "+14037757197", 
+    "chris": "+14037757197", 
+    "reception": "+14037757197"
 }
 
 # --- TOOLS ---
@@ -59,16 +61,6 @@ TRANSFER_TOOL_SCHEMA = {
             },
             "required": ["person_name"]
         }
-    }
-}
-
-# FIX: Dummy tool to prevent "400 Error" crashes if AI hallucinates this
-FIRM_DIRECTORY_SCHEMA = {
-    "type": "function",
-    "function": {
-        "name": "firm_directory",
-        "description": "Checks the firm directory for lawyer specialties.",
-        "parameters": {"type": "object", "properties": {}}
     }
 }
 
@@ -128,7 +120,6 @@ def save_call_log_to_db(call_data: dict):
     if not conn: return
     try:
         with conn.cursor() as cursor:
-            # FIX: ON DUPLICATE KEY UPDATE to prevent crashes
             sql = """
                 INSERT INTO calls (call_sid, phone_number, system_number, timestamp, client_name, summary, full_transcript)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
@@ -202,7 +193,6 @@ class DeleteCallsRequest(BaseModel):
 
 @app.post("/twilio/transfer-failed")
 async def transfer_failed(request: Request):
-    """Handles failed transfers (busy/no-answer) by reconnecting to AI."""
     form = await request.form()
     call_sid = form.get("CallSid")
     dial_status = form.get("DialCallStatus")
@@ -213,8 +203,6 @@ async def transfer_failed(request: Request):
     if dial_status == "completed":
         return Response(content="<Response><Hangup/></Response>", media_type="application/xml")
 
-    # --- BOOMERANG LOGIC ---
-    # 1. Log the miss to the dashboard
     call_data = call_db.get(call_sid)
     if call_data:
         lawyer_main_phone = call_data.get("system_number")
@@ -226,22 +214,14 @@ async def transfer_failed(request: Request):
         }
         save_schedule_request_to_db(lawyer_main_phone, request_args)
 
-    # 2. Set Apology Greeting for Reconnection
     if call_sid in active_call_config:
-        apology_msg = f"I apologize, but {target_name} is currently unavailable. May I have your name and phone number so they can return your call?"
-        active_call_config[call_sid]["greeting"] = apology_msg
+        # Force apology greeting on reconnect
+        active_call_config[call_sid]["greeting"] = f"I apologize, but {target_name} is currently unavailable. May I have your name so they can return your call?"
     
     host = PUBLIC_URL.replace("https://", "wss://").replace("http://", "ws://")
     stream_url = f"{host}/media-ws"
     
-    # 3. Reconnect Stream
-    twiml = f"""
-    <Response>
-        <Connect>
-            <Stream url="{stream_url}" />
-        </Connect>
-    </Response>
-    """
+    twiml = f"""<Response><Connect><Stream url="{stream_url}" /></Connect></Response>"""
     return Response(content=twiml, media_type="application/xml")
 
 @app.post("/api/schedule/reject/{request_id}")
@@ -473,8 +453,6 @@ async def execute_transfer(json_args, call_sid):
             print(f"[{call_sid}] EXECUTING TRANSFER -> {target_name}")
             callback_url = f"{PUBLIC_URL}/twilio/transfer-failed?target={target_name}"
             
-            # SILENT TRANSFER: No <Say> here. We let the AI speak the confirmation, then Twilio just dials.
-            # This prevents the "Robot Voice" from interrupting.
             twiml = f"""
                 <Response>
                     <Dial action="{callback_url}" timeout="20" answerOnBridge="true" machineDetection="Enable">
@@ -483,14 +461,12 @@ async def execute_transfer(json_args, call_sid):
                 </Response>
             """
             twilio_rest_client.calls(call_sid).update(twiml=twiml)
-            
-            # FIX: Updated the spoken phrase to match your request exactly
-            return f"<speak>Perfect. I'll transfer your call to {target_name.capitalize()}.</speak>"
+            return "<speak>Transferring you now.</speak>"
         else:
-            return "<speak>I apologize, but I cannot connect you at this time. May I take a message?</speak>"
+            return "<speak>I apologize, but I cannot connect you at this time.</speak>"
     except Exception as e:
         print(f"Transfer Error: {e}")
-        return "<speak>I am having trouble transferring you. May I take a message?</speak>"
+        return "<speak>I am having trouble transferring you.</speak>"
 
 async def generate_smart_response(user_text, system_prompt, history, caller_id, call_sid):
     if not groq_client: return "I apologize, I am having trouble."
@@ -503,37 +479,51 @@ async def generate_smart_response(user_text, system_prompt, history, caller_id, 
             role = "user" if line.startswith("User:") else "assistant"
             messages.append({"role": role, "content": line.split(":", 1)[1].strip()})
         messages.append({"role": "user", "content": user_text})
+        
+        # FIX: HIDDEN INSTRUCTION TO STOP HALLUCINATIONS
+        messages.append({"role": "system", "content": "CRITICAL: Do NOT call 'firm_directory' or any tools other than 'transfer_call'. If you want to look something up, do not. Just answer the user."})
 
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=messages, model="llama-3.1-8b-instant", 
-            tools=[TRANSFER_TOOL_SCHEMA, FIRM_DIRECTORY_SCHEMA], # FIX: Included dummy tool
+            tools=[TRANSFER_TOOL_SCHEMA], 
             max_tokens=150
         ))
 
         # 1. Check for Tool Call
         if completion.choices[0].message.tool_calls:
-            tool = completion.choices[0].message.tool_calls[0]
-            if tool.function.name == "transfer_call":
-                return await execute_transfer(tool.function.arguments, call_sid)
-            elif tool.function.name == "firm_directory":
-                # FIX: Handle hallucinated directory lookup by being helpful
-                return "<speak>I can transfer you to James for Real Estate or Chris for Family Law. Which would you prefer?</speak>"
+            return await execute_transfer(completion.choices[0].message.tool_calls[0].function.arguments, call_sid)
 
-        # 2. Check for Hallucinated Tool Tags (Safety Net)
-        raw = completion.choices[0].message.content
-        match = re.search(r"<function=transfer_call>(.*?)</function>", raw, re.DOTALL)
+        # 2. RESURRECTION LOGIC (Recover from 400 or Hallucinated XML)
+        raw_response = completion.choices[0].message.content
+        
+        # If the AI hallucinated the XML but Groq didn't catch it as a tool
+        match = re.search(r"<function=transfer_call>(.*?)</function>", raw_response, re.DOTALL)
         if match:
             return await execute_transfer(match.group(1).strip(), call_sid)
 
-        # 3. Standard Text Output
-        clean = re.sub(r"<function.*?>.*?</function>", "", raw).strip()
-        if "<speak>" in clean: clean = clean.replace("<speak>", "").replace("</speak>", "")
-        return f"<speak>{clean}</speak>"
+        # 3. Standard Text Extraction
+        cleaned_response = re.sub(r"<function.*?>.*?</function>", "", raw_response).strip()
+        if "<speak>" in cleaned_response: 
+            cleaned_response = cleaned_response.replace("<speak>", "").replace("</speak>", "")
+        
+        return f"<speak>{cleaned_response}</speak>"
 
     except Exception as e:
         print(f"Groq Error: {e}")
-        # FIX: Return speech even on error so it doesn't go silent
+        
+        # FIX: RECOVER FROM 400 ERROR BY EXTRACTING THE SPEECH
+        # If Groq blocked the request but returned the 'failed_generation' in the error message
+        if "failed_generation" in str(e):
+            try:
+                # Extract the <speak>...</speak> part from the error message
+                # This is the 'Ghost Text' the AI wanted to say before it crashed
+                match = re.search(r"<speak>(.*?)</speak>", str(e), re.DOTALL)
+                if match:
+                    print(f"[{call_sid}] Recovered speech from 400 Error.")
+                    return f"<speak>{match.group(1)}</speak>"
+            except: pass
+            
         return "<speak>I apologize, could you please repeat that?</speak>"
 
 # --- EXTRACT & SUMMARIZE ---
@@ -556,23 +546,20 @@ async def extract_client_name(transcript, call_sid):
 async def generate_call_summary(call_sid):
     if not groq_client or call_sid not in transcripts: return
     full_text = "\n".join(transcripts[call_sid])
-    
-    # Save final state
-    call_data = call_db.get(call_sid, {})
-    call_data["full_transcript"] = full_text
-    save_call_log_to_db(call_data)
+    call_db[call_sid]["full_transcript"] = full_text
+    save_call_log_to_db(call_db[call_sid])
     
     try:
         loop = asyncio.get_running_loop()
         res = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=[
-                {"role": "system", "content": "Summarize the caller's intent in 5 words."},
+                {"role": "system", "content": "Summarize the caller's intent in 3-5 words."},
                 {"role": "user", "content": full_text}
             ],
             model="llama-3.1-8b-instant", max_tokens=15
         ))
         call_db[call_sid]["summary"] = res.choices[0].message.content.strip()
-        save_call_log_to_db(call_db[call_sid]) # Save again with summary
+        save_call_log_to_db(call_db[call_sid]) 
     except Exception: pass
 
 async def transcribe_raw_audio(raw):
