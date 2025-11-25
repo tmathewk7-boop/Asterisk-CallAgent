@@ -1,4 +1,5 @@
 import os
+import html
 import pymysql
 import base64
 import re
@@ -128,7 +129,7 @@ def get_user_settings(phone_number: str) -> Dict[str, Any]:
                 FROM users 
                 WHERE phone_number = %s
             """
-            cursor.execute(sql, (phone_number,))
+            cursor.(sql, (phone_number,))
             settings = cursor.fetchone()
             return settings if settings else {}
     finally:
@@ -265,7 +266,7 @@ async def update_settings(settings: AgentSettings):
                     personal_phone = %s
                 WHERE phone_number = %s
             """
-            cursor.execute(sql, (
+            cursor.(sql, (
                 settings.system_prompt,
                 settings.greeting,
                 settings.personal_phone,
@@ -296,7 +297,7 @@ async def get_schedule_requests(user_phone: str):
                 WHERE user_phone = %s AND status = 'PENDING'
                 ORDER BY timestamp DESC
             """
-            cursor.execute(sql, (user_phone,))
+            cursor.(sql, (user_phone,))
             requests = cursor.fetchall()
             return requests
     finally:
@@ -312,7 +313,7 @@ async def toggle_agent(req: ToggleRequest):
     try:
         with conn.cursor() as cursor:
             sql = "UPDATE users SET ai_active = %s WHERE phone_number = %s"
-            cursor.execute(sql, (req.active, req.phone_number))
+            cursor.(sql, (req.active, req.phone_number))
         conn.commit()
         return {"status": "success", "active": req.active}
     except Exception as e:
@@ -672,7 +673,7 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
         if completion.choices[0].message.tool_calls:
             tool_call = completion.choices[0].message.tool_calls[0]
             if tool_call.function.name == "transfer_call":
-                return await execute_transfer(tool_call.function.arguments, call_sid)
+                return await _transfer(tool_call.function.arguments, call_sid)
 
         # --- 2. CHECK FOR HALLUCINATED TOOL CALLS (The Fix) ---
         raw_response = completion.choices[0].message.content
@@ -684,7 +685,7 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
         if match:
             print(f"[{call_sid}] CAUGHT HALLUCINATED TRANSFER: {match.group(1)}")
             json_args = match.group(1).strip()
-            return await execute_transfer(json_args, call_sid)
+            return await _transfer(json_args, call_sid)
 
         # --- 3. STANDARD TEXT CLEANING (If no transfer) ---
         cleaned_response = re.sub(r'\s+', ' ', raw_response).strip()
@@ -701,11 +702,20 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
         print(f"Groq generation failed: {e}")
         return "I apologize, I experienced a brief issue."
 
-# --- NEW HELPER FUNCTION TO AVOID DUPLICATE LOGIC ---
+# --- REPLACE THIS FUNCTION AT THE BOTTOM OF app.py ---
+
 async def execute_transfer(json_args, call_sid):
     """Parses args and executes the Twilio transfer."""
     try:
-        args = json.loads(json_args)
+        # FIX: Decode HTML entities (turns &quot; back into ")
+        clean_json = html.unescape(json_args)
+        
+        # FIX: Replace single quotes with double quotes just in case the LLM used Python syntax
+        clean_json = clean_json.replace("'", '"')
+        
+        print(f"[{call_sid}] Parsing Transfer JSON: {clean_json}")
+        
+        args = json.loads(clean_json)
         target_name = args.get("person_name", "").lower()
         target_number = FIRM_DIRECTORY.get(target_name)
         
@@ -729,7 +739,6 @@ async def execute_transfer(json_args, call_sid):
             twilio_rest_client.calls(call_sid).update(twiml=transfer_twiml)
             return "<speak>Transferring you now.</speak>"
         else:
-            # This is what the caller hears if the setup fails
             return "<speak>I apologize, but I am unable to connect the call due to a technical configuration error.</speak>"
             
     except Exception as e:
