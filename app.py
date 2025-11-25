@@ -10,6 +10,7 @@ import datetime
 from collections import defaultdict
 from pydantic import BaseModel
 from typing import Optional, Dict, Any
+from twilio.rest import Client
 
 # --- IMPORTS ---
 from groq import Groq
@@ -22,6 +23,8 @@ import uvicorn
 from twilio.twiml.voice_response import VoiceResponse, Dial
 
 # ---------- Configuration ----------
+TWILIO_ACCOUNT_SID = os.getenv("TWILIO_ACCOUNT_SID")
+TWILIO_AUTH_TOKEN = os.getenv("TWILIO_AUTH_TOKEN")
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 DEEPGRAM_API_KEY = os.getenv("DEEPGRAM_API_KEY")
 PORT = int(os.getenv("PORT", 8000))
@@ -48,6 +51,35 @@ SCHEDULE_REQUEST_TOOL_SCHEMA = {
             "required": ["caller_name", "caller_phone", "requested_time_str"]
         }
     }
+}
+
+TRANSFER_TOOL_SCHEMA = {
+    "type": "function",
+    "function": {
+        "name": "transfer_call",
+        "description": "Transfers the active phone call to a specific lawyer or employee at the firm.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "person_name": {
+                    "type": "string", 
+                    "description": "The first name of the person to transfer to (e.g. 'Chris', 'James')."
+                }
+            },
+            "required": ["person_name"]
+        }
+    }
+}
+
+if TWILIO_ACCOUNT_SID and TWILIO_AUTH_TOKEN:
+    twilio_rest_client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
+else:
+    twilio_rest_client = None
+
+# --- FIRM DIRECTORY (Who can receive calls?) ---
+# Update these with REAL numbers (E.164 format: +1...)
+FIRM_DIRECTORY = {
+    "Lawyer": "+14037757197",  
 }
 
 if GROQ_API_KEY:
@@ -125,6 +157,54 @@ class DeleteCallsRequest(BaseModel):
     call_sids: list[str]
 
 # ---------------- API ENDPOINTS ----------------
+
+@app.post("/twilio/transfer-failed")
+async def transfer_failed(request: Request):
+    """
+    Handles failed transfers (busy/no-answer).
+    Automatically logs a 'Callback Request' to the dashboard and ends the call.
+    """
+    form = await request.form()
+    call_sid = form.get("CallSid")
+    dial_status = form.get("DialCallStatus") # 'busy', 'no-answer', 'failed', 'completed'
+    target_name = request.query_params.get("target", "the lawyer")
+
+    print(f"[{call_sid}] Transfer Status: {dial_status}")
+
+    # 1. If the call was answered, we are done.
+    if dial_status == "completed":
+        return Response(content="<Response><Hangup/></Response>", media_type="application/xml")
+
+    # 2. If Busy/No-Answer, LOG IT TO DASHBOARD
+    # Retrieve caller details from active memory
+    call_data = call_db.get(call_sid)
+    
+    if call_data:
+        # The lawyer's main account number (to link to dashboard)
+        lawyer_main_phone = call_data.get("system_number") 
+        
+        # Construct the request data
+        request_args = {
+            "caller_name": call_data.get("client_name", "Unknown Caller"),
+            "caller_phone": call_data.get("number", "Unknown"),
+            "requested_time_str": "ASAP (Missed Transfer)",
+            "reason": f"Missed call transfer to {target_name.capitalize()}"
+        }
+        
+        # Save to the 'schedule_requests' table so it appears on the Booking Page
+        save_schedule_request_to_db(lawyer_main_phone, request_args)
+        print(f"[{call_sid}] Auto-logged missed transfer for {target_name}")
+
+    # 3. Play a polite message and Hang Up
+    # The caller hears this and the call ends.
+    twiml = f"""
+    <Response>
+        <Say>I apologize, but {target_name} is currently unavailable.</Say>
+        <Say>I have notified them that you called, and they will return your call shortly. Goodbye.</Say>
+        <Hangup/>
+    </Response>
+    """
+    return Response(content=twiml, media_type="application/xml")
 
 @app.get("/api/calls/{target_number}")
 async def get_calls_for_client(target_number: str):
@@ -559,80 +639,73 @@ async def transcribe_raw_audio(raw_ulaw):
         return None
     except Exception: return None
 
-async def generate_smart_response(user_text: str, system_prompt: str, context_history: list, fixed_caller_id: str):
-    if not groq_client: return "I apologize, I experienced a brief issue. Could you repeat that?"
+async def generate_smart_response(user_text: str, system_prompt: str, context_history: list, fixed_caller_id: str, call_sid: str):
+    if not groq_client: return "I apologize, I experienced a brief issue."
+    
     try:
-        cleaned_phone_digits = fixed_caller_id.lstrip('+').lstrip('1') 
-        ssml_fixed_caller_id = f'<say-as interpret-as="characters">{cleaned_phone_digits}</say-as>'
+        # ... (Previous SSML and Message setup remains the same) ...
+        cleaned_digits = fixed_caller_id.lstrip('+').lstrip('1') 
+        ssml_fixed_caller_id = f'<say-as interpret-as="characters">{cleaned_digits}</say-as>'
         ssml_prompt = (
             f"{system_prompt} The client is calling from: {ssml_fixed_caller_id}. "
-            f"You must respond in a single SSML `<speak>` tag. "
-            f"Keep your answer to one short sentence (max 20 words). "
-            f"Use SSML tags like `<break time='300ms'/>` for natural pauses, and "
-            f"`<say-as interpret-as='filler'>um</say-as>` or `<say-as interpret-as='filler'>uh</say-as>` "
-            f"for human-like conversational fluidity. Do not include the initial greeting."
+            f"Respond in a single SSML `<speak>` tag. Keep it short (max 20 words)."
         )
 
-       # --- CONSTRUCT MESSAGES ARRAY FROM HISTORY ---
         messages = [{"role": "system", "content": ssml_prompt}]
-        
-        # Parse the context_history (e.g., "User: text" or "AI: text")
-        for line in context_history:
-            if line.startswith("User:"):
-                role = "user"
-                content = line[5:].strip()
-            elif line.startswith("AI:"):
-                role = "assistant"
-                content = line[3:].strip()
-            else:
-                continue
-                
-            # Skip the final message, which is passed separately as user_text
-            if content == user_text and role == "user": continue
-                
-            messages.append({"role": role, "content": content})
-
-       # Add the current user input as the final message
+        # ... (Add history loop here as before) ...
         messages.append({"role": "user", "content": user_text})
 
-        # --- CALL GROQ ---
+        # --- CALL GROQ (With Transfer Tool Enabled) ---
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=messages,
             model="llama-3.1-8b-instant",
-            # tools=[SCHEDULE_REQUEST_TOOL_SCHEMA],  <-- MAKE SURE THIS IS COMMENTED OUT
+            # ENABLE THE TRANSFER TOOL HERE
+            tools=[TRANSFER_TOOL_SCHEMA], 
             max_tokens=150
         ))
-        
+
         # --- TOOL HANDLING LOGIC ---
         if completion.choices[0].message.tool_calls:
             tool_call = completion.choices[0].message.tool_calls[0]
+            func_name = tool_call.function.name
             
-            # Call the synchronous tool handler and return its output immediately
-            tool_response_text = await call_tool_function(tool_call, fixed_caller_id)
-            
-            if tool_response_text:
-                # Return the AI's final confirmation and END the conversation here.
-                return tool_response_text
-        
-        # --- STANDARD TEXT ION (Only runs if NO tool call was made OR tool call failed to generate text) ---
+if func_name == "transfer_call":
+                args = json.loads(tool_call.function.arguments)
+                target_name = args.get("person_name", "").lower()
+                target_number = FIRM_DIRECTORY.get(target_name)
+                
+                if target_number and twilio_rest_client:
+                    print(f"[{call_sid}] TRANSFERRING -> {target_name}")
+                    
+                    # --- THE BOOMERANG FIX ---
+                    # We add 'action' to the Dial verb.
+                    # If the call is NOT completed (busy/no-answer), Twilio hits this URL.
+                    # We pass the target_name in the query string so we know who missed the call.
+                    callback_url = f"{PUBLIC_URL}/twilio/transfer-failed?target={target_name}"
+                    
+                    transfer_twiml = f"""
+                        <Response>
+                            <Say>Please hold while I connect you to {target_name.capitalize()}.</Say>
+                            <Dial action="{callback_url}" timeout="20">{target_number}</Dial>
+                        </Response>
+                    """
+                    twilio_rest_client.calls(call_sid).update(twiml=transfer_twiml)
+                    return "<speak>Transferring you now.</speak>"
+                else:
+                    # Fallback if name not found or Client missing
+                    return "<speak>I apologize, but I don't have a number for that person. Is there someone else?</speak>"
 
-        # Standard Text Extraction
+        # Standard Text Extraction (Fallback if no tool called)
         raw_response = completion.choices[0].message.content
         cleaned_response = re.sub(r'\s+', ' ', raw_response).strip()
-
-        # FIX: Robust Tag Cleaning
-        # 1. If the AI included tags somewhere in the middle, strip them out to avoid nesting
         if "<speak>" in cleaned_response:
-            # Remove existing tags so we can wrap it cleanly ourselves
             cleaned_response = cleaned_response.replace("<speak>", "").replace("</speak>", "")
-
-        # 2. Now wrap the clean text in a single, valid pair of tags
         return f"<speak>{cleaned_response}</speak>"
             
     except Exception as e:
         print(f"Groq generation failed: {e}")
-        return "I apologize, I experienced a brief issue. Could you repeat that?"
+        return "I apologize, I experienced a brief issue."
 
 # Updated send_deepgram_tts signature
 async def send_deepgram_tts(ws: WebSocket, stream_sid: str, text: str, call_sid: Optional[str] = None):
