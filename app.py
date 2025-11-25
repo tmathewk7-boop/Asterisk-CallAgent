@@ -411,7 +411,7 @@ async def media_ws_endpoint(ws: WebSocket):
     finally:
         if call_sid:
             if call_sid in call_db: call_db[call_sid]["status"] = "Ended"
-            asyncio.create_task(generate_call_summary(call_sid))
+            asyncio.create_task(call_summary(call_sid))
             if call_sid in media_ws_map: del media_ws_map[call_sid]
             if call_sid in full_sentence_buffer: del full_sentence_buffer[call_sid]
             if call_sid in active_call_config: del active_call_config[call_sid]
@@ -447,7 +447,7 @@ async def handle_complete_sentence(call_sid, stream_sid, audio):
         
         config = active_call_config.get(call_sid, DEFAULT_CONFIG)
         
-        response_text = await generate_smart_response(
+        response_text = await smart_response(
             transcript, 
             config.get("system_prompt", "You are a helpful assistant."), 
             transcripts[call_sid][-10:], 
@@ -497,8 +497,17 @@ async def execute_transfer(json_args, call_sid):
 async def generate_smart_response(user_text, system_prompt, history, caller_id, call_sid):
     if not groq_client: return "I apologize, I am having trouble."
     try:
-        cleaned_id = caller_id.lstrip('+').lstrip('1')
-        ssml_prompt = f"{system_prompt} Client Caller ID: <say-as interpret-as='characters'>{cleaned_id}</say-as>. Respond in a single short SSML <speak> tag."
+        # FIX: Space out digits so AI reads them one by one (e.g. "4 0 3" vs "403")
+        raw_digits = caller_id.lstrip('+').lstrip('1')
+        spaced_digits = " ".join(list(raw_digits)) # "4 0 3 7 7 5..."
+        
+        # Inject the spaced number into the prompt
+        ssml_prompt = (
+            f"{system_prompt} "
+            f"The Client's Caller ID is: {spaced_digits}. "
+            f"When saying the number, read it exactly as shown with spaces. "
+            f"Respond in a single short SSML <speak> tag."
+        )
         
         messages = [{"role": "system", "content": ssml_prompt}]
         for line in history:
@@ -506,8 +515,8 @@ async def generate_smart_response(user_text, system_prompt, history, caller_id, 
             messages.append({"role": role, "content": line.split(":", 1)[1].strip()})
         messages.append({"role": "user", "content": user_text})
         
-        # FIX: HIDDEN INSTRUCTION TO STOP HALLUCINATIONS
-        messages.append({"role": "system", "content": "CRITICAL: Do NOT call 'firm_directory' or any tools other than 'transfer_call'. If you want to look something up, do not. Just answer the user."})
+        # Hidden instruction to prevent hallucinations
+        messages.append({"role": "system", "content": "CRITICAL: Do NOT call 'firm_directory' or unknown tools. Just answer."})
 
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
@@ -520,36 +529,25 @@ async def generate_smart_response(user_text, system_prompt, history, caller_id, 
         if completion.choices[0].message.tool_calls:
             return await execute_transfer(completion.choices[0].message.tool_calls[0].function.arguments, call_sid)
 
-        # 2. RESURRECTION LOGIC (Recover from 400 or Hallucinated XML)
-        raw_response = completion.choices[0].message.content
-        
-        # If the AI hallucinated the XML but Groq didn't catch it as a tool
-        match = re.search(r"<function=transfer_call>(.*?)</function>", raw_response, re.DOTALL)
+        # 2. Check for Hallucinated Tool
+        raw = completion.choices[0].message.content
+        match = re.search(r"<function=transfer_call>(.*?)</function>", raw, re.DOTALL)
         if match:
             return await execute_transfer(match.group(1).strip(), call_sid)
 
-        # 3. Standard Text Extraction
-        cleaned_response = re.sub(r"<function.*?>.*?</function>", "", raw_response).strip()
-        if "<speak>" in cleaned_response: 
-            cleaned_response = cleaned_response.replace("<speak>", "").replace("</speak>", "")
+        # 3. Standard Text Output
+        clean = re.sub(r"<function.*?>.*?</function>", "", raw).strip()
+        if "<speak>" in clean: clean = clean.replace("<speak>", "").replace("</speak>", "")
         
-        return f"<speak>{cleaned_response}</speak>"
+        return f"<speak>{clean}</speak>"
 
     except Exception as e:
         print(f"Groq Error: {e}")
-        
-        # FIX: RECOVER FROM 400 ERROR BY EXTRACTING THE SPEECH
-        # If Groq blocked the request but returned the 'failed_generation' in the error message
         if "failed_generation" in str(e):
             try:
-                # Extract the <speak>...</speak> part from the error message
-                # This is the 'Ghost Text' the AI wanted to say before it crashed
                 match = re.search(r"<speak>(.*?)</speak>", str(e), re.DOTALL)
-                if match:
-                    print(f"[{call_sid}] Recovered speech from 400 Error.")
-                    return f"<speak>{match.group(1)}</speak>"
+                if match: return f"<speak>{match.group(1)}</speak>"
             except: pass
-            
         return "<speak>I apologize, could you please repeat that?</speak>"
 
 # --- EXTRACT & SUMMARIZE ---
