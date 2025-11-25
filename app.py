@@ -266,7 +266,7 @@ async def update_settings(settings: AgentSettings):
                     personal_phone = %s
                 WHERE phone_number = %s
             """
-            cursor.(sql, (
+            cursor.execute(sql, (
                 settings.system_prompt,
                 settings.greeting,
                 settings.personal_phone,
@@ -297,7 +297,7 @@ async def get_schedule_requests(user_phone: str):
                 WHERE user_phone = %s AND status = 'PENDING'
                 ORDER BY timestamp DESC
             """
-            cursor.(sql, (user_phone,))
+            cursor.execute(sql, (user_phone,))
             requests = cursor.fetchall()
             return requests
     finally:
@@ -313,7 +313,7 @@ async def toggle_agent(req: ToggleRequest):
     try:
         with conn.cursor() as cursor:
             sql = "UPDATE users SET ai_active = %s WHERE phone_number = %s"
-            cursor.(sql, (req.active, req.phone_number))
+            cursor.execute(sql, (req.active, req.phone_number))
         conn.commit()
         return {"status": "success", "active": req.active}
     except Exception as e:
