@@ -659,8 +659,10 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
             messages=messages,
             model="llama-3.1-8b-instant",
-            # ENABLE THE TRANSFER TOOL HERE
+            
+            # CRITICAL FIX: Uncomment this and add TRANSFER_TOOL_SCHEMA
             tools=[TRANSFER_TOOL_SCHEMA], 
+            
             max_tokens=150
         ))
 
