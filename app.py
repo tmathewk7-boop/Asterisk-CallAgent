@@ -129,7 +129,7 @@ def get_user_settings(phone_number: str) -> Dict[str, Any]:
                 FROM users 
                 WHERE phone_number = %s
             """
-            cursor.(sql, (phone_number,))
+            cursor.execute(sql, (phone_number,))
             settings = cursor.fetchone()
             return settings if settings else {}
     finally:
