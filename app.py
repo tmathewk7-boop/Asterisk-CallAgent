@@ -37,10 +37,10 @@ MS_AUTH_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
 MS_TOKEN_URL = "https://login.microsoftonline.com/common/oauth2/v2.0/token"
 MS_GRAPH_URL = "https://graph.microsoft.com/v1.0"
 
-# --- FIRM DIRECTORY (Who can receive calls?) ---
+# --- FIRM DIRECTORY ---
 # Keys must be lowercase single names to match AI output
 FIRM_DIRECTORY = {
-    "james": "+13065183350", 
+    "james": "+13065183350"
 }
 
 # --- TOOLS ---
@@ -188,52 +188,54 @@ class DeleteCallsRequest(BaseModel):
 @app.post("/twilio/transfer-failed")
 async def transfer_failed(request: Request):
     """
-    Handles failed transfers (busy/no-answer/machine).
+    Handles failed transfers (busy/no-answer).
+    Reconnects the caller to the AI so it can take a message.
     """
     form = await request.form()
     call_sid = form.get("CallSid")
     dial_status = form.get("DialCallStatus")
-    answered_by = form.get("AnsweredBy")
-    target_name = request.query_params.get("target", "the lawyer")
+    target_name = request.query_params.get("target", "the lawyer").capitalize()
 
-    print(f"[{call_sid}] Transfer Status: {dial_status}, AnsweredBy: {answered_by}")
+    print(f"[{call_sid}] Transfer Status: {dial_status}")
 
-    if dial_status == "completed" and answered_by == "human":
+    # If successful, hang up (call is done)
+    if dial_status == "completed":
         return Response(content="<Response><Hangup/></Response>", media_type="application/xml")
 
-    # --- BOOMERANG LOGIC ---
-    call_data = call_db.get(call_sid)
-    if call_data:
-        lawyer_main_phone = call_data.get("system_number")
-        client_name = call_data.get("client_name", "Unknown Caller")
-        
-        fail_reason = "Missed Call"
-        if answered_by and "machine" in answered_by:
-            fail_reason = "Sent to Voicemail"
-        elif dial_status == "busy":
-            fail_reason = "Line Busy"
-
-        request_args = {
-            "caller_name": client_name,
-            "caller_phone": call_data.get("number", "Unknown"),
-            "requested_time_str": "ASAP",
-            "reason": f"Missed transfer to {target_name.capitalize()} ({fail_reason})"
-        }
-        
-        save_schedule_request_to_db(lawyer_main_phone, request_args)
-        print(f"[{call_sid}] Auto-logged missed transfer: {fail_reason}")
-
-    # --- FULL MESSAGE FLOW SCRIPT (Voice Consistency) ---
-    # Using Polly.Joanna-Neural to match the AI voice
+    # --- BOOMERANG LOGIC (Reconnect to AI) ---
+    # We update the AI's config to force a specific apology message upon reconnection
+    if call_sid in active_call_config:
+        apology_msg = f"I apologize, but {target_name} is currently unavailable. May I have your name and phone number so they can return your call?"
+        active_call_config[call_sid]["greeting"] = apology_msg
+    
+    # Generate Websocket URL
+    host = PUBLIC_URL.replace("https://", "wss://").replace("http://", "ws://")
+    stream_url = f"{host}/media-ws"
+    
+    # TwiML to reconnect the stream
     twiml = f"""
     <Response>
-        <Say voice="Polly.Joanna-Neural">I apologize, but {target_name} is currently unavailable.</Say>
-        <Say voice="Polly.Joanna-Neural">I have notified them that you called, and they will return your call shortly.</Say>
-        <Say voice="Polly.Joanna-Neural">Thank you for calling our law firm. Have a good day.</Say>
-        <Hangup/>
+        <Connect>
+            <Stream url="{stream_url}" />
+        </Connect>
     </Response>
     """
     return Response(content=twiml, media_type="application/xml")
+
+@app.post("/api/schedule/reject/{request_id}")
+async def reject_schedule_request(request_id: int, payload: dict):
+    conn = get_db_connection()
+    if not conn: return JSONResponse({"status": "error"}, status_code=500)
+    try:
+        with conn.cursor() as cursor:
+            sql = "DELETE FROM schedule_requests WHERE request_id = %s"
+            cursor.execute(sql, (request_id,))
+        conn.commit()
+        return {"status": "success"}
+    except Exception as e:
+        return JSONResponse({"status": "error", "message": str(e)}, status_code=500)
+    finally:
+        if conn: conn.close()
 
 @app.get("/api/calls/{target_number}")
 async def get_calls_for_client(target_number: str):
@@ -368,7 +370,9 @@ async def media_ws_endpoint(ws: WebSocket):
                 media_ws_map[call_sid] = ws
                 
                 config = active_call_config.get(call_sid, DEFAULT_CONFIG)
-                await send_deepgram_tts(ws, stream_sid, config.get("greeting", "Hello."), call_sid)
+                # This greeting might be the "Apology" if coming from a failed transfer
+                greeting = config.get("greeting", "Hello.")
+                await send_deepgram_tts(ws, stream_sid, greeting, call_sid)
 
             elif event == "media" and call_sid:
                 chunk = base64.b64decode(data["media"]["payload"])
@@ -449,16 +453,18 @@ async def execute_transfer(json_args, call_sid):
             print(f"[{call_sid}] EXECUTING TRANSFER -> {target_name}")
             callback_url = f"{PUBLIC_URL}/twilio/transfer-failed?target={target_name}"
             
-            # FIX: Voice consistency (Polly.Joanna-Neural) + Machine Detection
+            # SILENT TRANSFER (No Robot Voice)
+            # We do NOT use <Say>. We just <Dial>. The caller hears ringing immediately.
             twiml = f"""
                 <Response>
-                    <Say voice="Polly.Joanna-Neural">Please hold while I connect you to {target_name.capitalize()}.</Say>
                     <Dial action="{callback_url}" timeout="20" answerOnBridge="true" machineDetection="Enable">
                         {target_number}
                     </Dial>
                 </Response>
             """
             twilio_rest_client.calls(call_sid).update(twiml=twiml)
+            
+            # The AI says "Transferring" before the switch happens (using Deepgram voice)
             return "<speak>Transferring you now.</speak>"
         else:
             return "<speak>I apologize, but I cannot connect you at this time.</speak>"
