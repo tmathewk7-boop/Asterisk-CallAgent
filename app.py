@@ -389,7 +389,7 @@ async def media_ws_endpoint(ws: WebSocket):
     finally:
         if call_sid:
             if call_sid in call_db: call_db[call_sid]["status"] = "Ended"
-            asyncio.create_task(generate_call_summary(call_sid))
+            asyncio.create_task(call_summary(call_sid))
             if call_sid in media_ws_map: del media_ws_map[call_sid]
             if call_sid in full_sentence_buffer: del full_sentence_buffer[call_sid]
             if call_sid in active_call_config: del active_call_config[call_sid]
@@ -426,7 +426,7 @@ async def handle_complete_sentence(call_sid, stream_sid, audio):
         
         config = active_call_config.get(call_sid, DEFAULT_CONFIG)
         
-        response_text = await generate_smart_response(
+        response_text = await smart_response(
             transcript, 
             config.get("system_prompt", "You are a helpful assistant."), 
             transcripts[call_sid][-10:], 
@@ -447,6 +447,7 @@ async def handle_complete_sentence(call_sid, stream_sid, audio):
     except Exception as e:
         print(f"Error handling sentence: {e}")
 
+# --- REPLACE execute_transfer IN app.py ---
 async def execute_transfer(json_args, call_sid):
     try:
         clean_json = html.unescape(json_args).replace("'", '"')
@@ -458,8 +459,7 @@ async def execute_transfer(json_args, call_sid):
             print(f"[{call_sid}] EXECUTING TRANSFER -> {target_name}")
             callback_url = f"{PUBLIC_URL}/twilio/transfer-failed?target={target_name}"
             
-            # SILENT TRANSFER (No Robot Voice)
-            # We do NOT use <Say>. We just <Dial>. The caller hears ringing immediately.
+            # SILENT TRANSFER: Dial, letting Twilio handle the ringing.
             twiml = f"""
                 <Response>
                     <Dial action="{callback_url}" timeout="20" answerOnBridge="true" machineDetection="Enable">
@@ -472,14 +472,19 @@ async def execute_transfer(json_args, call_sid):
             # The AI says "Transferring" before the switch happens (using Deepgram voice)
             return "<speak>Transferring you now.</speak>"
         else:
-            return "<speak>I apologize, but I cannot connect you to James right now. Would you like to leave a message for him?</speak>"
+            # If the lawyer name is not in the directory
+            return "<speak>I apologize, I cannot find that person in the firm directory. Could you spell the name for me?</speak>"
     except Exception as e:
         print(f"Transfer Error: {e}")
         return "<speak>I am having trouble transferring you.</speak>"
 
+# --- REPLACE generate_smart_response IN app.py ---
 async def generate_smart_response(user_text, system_prompt, history, caller_id, call_sid):
     if not groq_client: return "I apologize, I am having trouble."
+    
+    # We will put the entire Groq call in a block to catch *any* failure.
     try:
+        # 1. Prepare Prompt
         cleaned_id = caller_id.lstrip('+').lstrip('1')
         ssml_prompt = f"{system_prompt} Client Caller ID: <say-as interpret-as='characters'>{cleaned_id}</say-as>. Respond in a single short SSML <speak> tag."
         
@@ -489,38 +494,38 @@ async def generate_smart_response(user_text, system_prompt, history, caller_id, 
             messages.append({"role": role, "content": line.split(":", 1)[1].strip()})
         messages.append({"role": "user", "content": user_text})
 
+        # 2. Call Groq
         loop = asyncio.get_running_loop()
         completion = await loop.run_in_executor(None, lambda: groq_client.chat.completions.create(
-            messages=messages,
-            model="llama-3.1-8b-instant",
+            messages=messages, 
+            model="llama-3.1-8b-instant", 
             tools=[TRANSFER_TOOL_SCHEMA], 
             max_tokens=150
         ))
 
-        # 1. Check for Tool Call
+        # 3. Check for Tool Call
         if completion.choices[0].message.tool_calls:
             return await execute_transfer(completion.choices[0].message.tool_calls[0].function.arguments, call_sid)
 
-        # 2. Check for Hallucinated Tool
+        # 4. Check for Hallucinated Tool
         raw = completion.choices[0].message.content
         match = re.search(r"<function=transfer_call>(.*?)</function>", raw, re.DOTALL)
         if match:
             return await execute_transfer(match.group(1).strip(), call_sid)
 
-        # 3. Standard Text
+        # 5. Standard Text
         clean = re.sub(r"<function.*?>.*?</function>", "", raw).strip()
         if "<speak>" in clean: clean = clean.replace("<speak>", "").replace("</speak>", "")
         return f"<speak>{clean}</speak>"
 
     except Exception as e:
-        # FIX: specific logging for the "brave_search" or 400 errors
+        # This catches all Groq errors (400, 500, timeouts)
         error_str = str(e)
-        if "400" in error_str and "tool" in error_str:
-            print(f"[{call_sid}] AI attempted invalid tool use (Hallucination blocked).")
-            return "<speak>I apologize, could you please repeat that?</speak>"
-            
-        print(f"Groq generation failed: {e}")
-        return "I apologize, I experienced a brief issue."
+        print(f"[{call_sid}] Groq generation failed (Graceful fallback): {e}")
+        # Always return a speech tag to ensure the call doesn't go silent
+        if "brave_search" in error_str:
+             return "<speak>I apologize, could you please repeat that? I experienced a momentary glitch.</speak>"
+        return "<speak>I apologize, I am experiencing a brief issue. Could you please repeat your request?</speak>"
 
 # --- EXTRACT & SUMMARIZE ---
 async def extract_client_name(transcript, call_sid):
