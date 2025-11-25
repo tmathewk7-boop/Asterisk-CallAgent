@@ -118,9 +118,14 @@ def save_call_log_to_db(call_data: dict):
     if not conn: return
     try:
         with conn.cursor() as cursor:
+            # FIX: Use ON DUPLICATE KEY UPDATE to prevent crashes if the call exists
             sql = """
                 INSERT INTO calls (call_sid, phone_number, system_number, timestamp, client_name, summary, full_transcript)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                client_name = VALUES(client_name),
+                summary = VALUES(summary),
+                full_transcript = VALUES(full_transcript)
             """
             cursor.execute(sql, (
                 call_data.get('sid'),
