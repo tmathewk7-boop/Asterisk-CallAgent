@@ -79,7 +79,7 @@ else:
 # --- FIRM DIRECTORY (Who can receive calls?) ---
 # Update these with REAL numbers (E.164 format: +1...)
 FIRM_DIRECTORY = {
-    "Lawyer": "+14037757197",  
+    "James (Real Estate)": "+14037757197",  
 }
 
 if GROQ_API_KEY:
