@@ -670,7 +670,7 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
             tool_call = completion.choices[0].message.tool_calls[0]
             func_name = tool_call.function.name
             
-if func_name == "transfer_call":
+            if func_name == "transfer_call":
                 args = json.loads(tool_call.function.arguments)
                 target_name = args.get("person_name", "").lower()
                 target_number = FIRM_DIRECTORY.get(target_name)
