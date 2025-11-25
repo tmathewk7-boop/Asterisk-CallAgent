@@ -162,42 +162,48 @@ class DeleteCallsRequest(BaseModel):
 @app.post("/twilio/transfer-failed")
 async def transfer_failed(request: Request):
     """
-    Handles failed transfers (busy/no-answer).
-    Automatically logs a 'Callback Request' to the dashboard and ends the call.
+    Handles failed transfers. 
+    Treats 'Busy', 'No Answer', AND 'Machine Answer' as a missed call.
     """
     form = await request.form()
     call_sid = form.get("CallSid")
-    dial_status = form.get("DialCallStatus") # 'busy', 'no-answer', 'failed', 'completed'
+    dial_status = form.get("DialCallStatus") 
+    answered_by = form.get("AnsweredBy") # machine_start, human, or unknown
     target_name = request.query_params.get("target", "the lawyer")
 
-    print(f"[{call_sid}] Transfer Status: {dial_status}")
+    print(f"[{call_sid}] Transfer Result: Status={dial_status}, AnsweredBy={answered_by}")
 
-    # 1. If the call was answered, we are done.
-    if dial_status == "completed":
+    # --- LOGIC: If Human Answered, we are done. ---
+    if dial_status == "completed" and answered_by == "human":
         return Response(content="<Response><Hangup/></Response>", media_type="application/xml")
 
-    # 2. If Busy/No-Answer, LOG IT TO DASHBOARD
-    # Retrieve caller details from active memory
-    call_data = call_db.get(call_sid)
+    # --- LOGIC: If Machine Answered OR Busy OR No-Answer -> BOOMERANG ---
+    # (Everything below runs if the transfer failed or hit voicemail)
     
+    call_data = call_db.get(call_sid)
     if call_data:
-        # The lawyer's main account number (to link to dashboard)
         lawyer_main_phone = call_data.get("system_number") 
         
-        # Construct the request data
+        # Determine reason for dashboard
+        fail_reason = "Missed Call"
+        if answered_by and "machine" in answered_by:
+            fail_reason = "Sent to Voicemail (Machine Detected)"
+        elif dial_status == "busy":
+            fail_reason = "Line Busy"
+        elif dial_status == "no-answer":
+            fail_reason = "No Answer"
+
         request_args = {
             "caller_name": call_data.get("client_name", "Unknown Caller"),
             "caller_phone": call_data.get("number", "Unknown"),
-            "requested_time_str": "ASAP (Missed Transfer)",
-            "reason": f"Missed call transfer to {target_name.capitalize()}"
+            "requested_time_str": "ASAP",
+            "reason": f"Missed transfer to {target_name.capitalize()} ({fail_reason})"
         }
         
-        # Save to the 'schedule_requests' table so it appears on the Booking Page
         save_schedule_request_to_db(lawyer_main_phone, request_args)
-        print(f"[{call_sid}] Auto-logged missed transfer for {target_name}")
+        print(f"[{call_sid}] Auto-logged missed transfer: {fail_reason}")
 
-    # 3. Play a polite message and Hang Up
-    # The caller hears this and the call ends.
+    # Play apology to caller (since we hid the real voicemail from them)
     twiml = f"""
     <Response>
         <Say>I apologize, but {target_name} is currently unavailable.</Say>
@@ -206,7 +212,6 @@ async def transfer_failed(request: Request):
     </Response>
     """
     return Response(content=twiml, media_type="application/xml")
-
 @app.get("/api/calls/{target_number}")
 async def get_calls_for_client(target_number: str):
     """Returns calls only for the specific phone number."""
@@ -705,41 +710,40 @@ async def generate_smart_response(user_text: str, system_prompt: str, context_hi
 # --- REPLACE THIS FUNCTION AT THE BOTTOM OF app.py ---
 
 async def execute_transfer(json_args, call_sid):
-    """Parses args and executes the Twilio transfer."""
+    """Parses args and executes the Twilio transfer with Machine Detection."""
     try:
-        # FIX: Decode HTML entities (turns &quot; back into ")
-        clean_json = html.unescape(json_args)
-        
-        # FIX: Replace single quotes with double quotes just in case the LLM used Python syntax
-        clean_json = clean_json.replace("'", '"')
-        
-        print(f"[{call_sid}] Parsing Transfer JSON: {clean_json}")
-        
+        import html
+        clean_json = html.unescape(json_args).replace("'", '"')
         args = json.loads(clean_json)
         target_name = args.get("person_name", "").lower()
         target_number = FIRM_DIRECTORY.get(target_name)
         
-        # --- DEBUGGING PRINTS ---
         if not target_number:
-            print(f"[{call_sid}] TRANSFER FAILED: Name '{target_name}' not found in FIRM_DIRECTORY.")
-        if not twilio_rest_client:
-            print(f"[{call_sid}] TRANSFER FAILED: Twilio Client is None. Check environment variables.")
-        # ------------------------
-
+            print(f"[{call_sid}] TRANSFER FAILED: Name '{target_name}' not found.")
+        
         if target_number and twilio_rest_client:
             print(f"[{call_sid}] EXECUTING TRANSFER -> {target_name} ({target_number})")
             
             callback_url = f"{PUBLIC_URL}/twilio/transfer-failed?target={target_name}"
+            
+            # FIX: Added answerOnBridge="true" and machineDetection="Enable"
+            # answerOnBridge="true": Caller hears Twilio ringing/music, NOT the raw phone line audio (masks voicemail greeting).
+            # machineDetection="Enable": Twilio listens for a robot voice.
             transfer_twiml = f"""
                 <Response>
                     <Say>Please hold while I connect you to {target_name.capitalize()}.</Say>
-                    <Dial action="{callback_url}" timeout="20">{target_number}</Dial>
+                    <Dial action="{callback_url}" 
+                          timeout="20" 
+                          answerOnBridge="true" 
+                          machineDetection="Enable">
+                        {target_number}
+                    </Dial>
                 </Response>
             """
             twilio_rest_client.calls(call_sid).update(twiml=transfer_twiml)
             return "<speak>Transferring you now.</speak>"
         else:
-            return "<speak>I apologize, but I am unable to connect the call due to a technical configuration error.</speak>"
+            return "<speak>I apologize, but I am unable to connect the call.</speak>"
             
     except Exception as e:
         print(f"Transfer Execution Error: {e}")
