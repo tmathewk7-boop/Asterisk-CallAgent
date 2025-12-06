@@ -20,8 +20,7 @@ VAPI_WEBHOOK_SECRET = os.getenv("VAPI_WEBHOOK_SECRET", "your-secret")
 
 # --- FIRM DIRECTORY ---
 FIRM_DIRECTORY = {
-    "james": "+13065183350",
-    "sarah": "+15550001234"
+    "james": "+16784343303",
 }
 
 app = FastAPI()
