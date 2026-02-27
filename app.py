@@ -45,12 +45,16 @@ def get_db_connection() -> Optional[pymysql.Connection]:
 
 # ---------------- HELPERS ----------------
 def normalize_call(row: dict) -> dict:
+    # FIX: In your SQL query 'SELECT *', the column name is 'phone_number'
+    # but this function was looking for 'phone_number' and then trying to 
+    # map it to a key called 'phone'. We need to make sure the dashboard 
+    # receives exactly what it expects.
     return {
         "call_sid": row["call_sid"],
         "client_name": row.get("client_name", "Unknown"),
-        "phone": row.get("phone_number"),
+        "phone_number": row.get("phone_number", "Unknown"), # Changed key from 'phone' to 'phone_number'
         "summary": row.get("summary", ""),
-        "timestamp": row["timestamp"].strftime("%Y-%m-%d %I:%M %p")
+        "timestamp": row["timestamp"].strftime("%Y-%m-%d %I:%M %p") if row.get("timestamp") else "N/A"
     }
 
 def get_user_settings(system_number: str) -> dict:
@@ -84,8 +88,13 @@ def get_lawyer_by_name(system_number: str, name: str) -> Optional[str]:
 # ---------------- CALL STORAGE ----------------
 def save_call_log(call: dict):
     conn = get_db_connection()
+    if not conn: return
     try:
         with conn.cursor() as c:
+            # We extract the number from Vapi's specific nested JSON path
+            customer_number = call.get("customer", {}).get("number", "Unknown")
+            system_number = call.get("phoneNumber", {}).get("number", "Unknown")
+            
             c.execute("""
                 INSERT INTO calls (
                     call_sid, phone_number, system_number,
@@ -97,8 +106,8 @@ def save_call_log(call: dict):
                     full_transcript=VALUES(full_transcript)
             """, (
                 call["id"],
-                call["customer"]["number"],
-                call["phoneNumber"]["number"],
+                customer_number,
+                system_number,
                 datetime.datetime.utcnow(),
                 call.get("analysis", {}).get("structuredData", {}).get("client_name", "Unknown"),
                 call.get("analysis", {}).get("summary", ""),
@@ -187,48 +196,52 @@ async def vapi_webhook(request: Request):
     return {"status": "ignored"}
     
 # ---------------- VAPI WEBHOOK ----------------
+# Apply these decorators to catch ALL incoming Vapi signals
+@app.post("/")
+@app.post("/webhook")
 @app.post("/vapi/webhook")
-async def vapi_webhook(req: Request):
+async def combined_vapi_webhook(req: Request):
     payload = await req.json()
     msg = payload.get("message", {})
     msg_type = msg.get("type")
 
+    # This is the event that contains the final phone number and summary
+    if msg_type == "end-of-call-report":
+        call = msg.get("call", {})
+        if call:
+            # 1. This function extracts 'customer' -> 'number'
+            save_call_log(call) 
+            
+            # 2. Handle appointments if they exist
+            appt = call.get("analysis", {}).get("appointment")
+            if appt:
+                save_appointment(
+                    call["id"],
+                    appt["status"],
+                    appt["proposed_time"],
+                    appt.get("attempt", 1),
+                    call.get("analysis", {}).get("summary", "")
+                )
+            return {"status": "success"}
+
+    # Handle live tool calls (like transfers)
     if msg_type == "tool-calls":
         results = []
-        system_number = msg["call"]["phoneNumber"]["number"]
-
+        # Safely get the system number for lawyer lookup
+        phone_data = msg.get("call", {}).get("phoneNumber", {})
+        system_number = phone_data.get("number")
+        
         for tool in msg.get("toolCalls", []):
-            name = tool["function"]["name"]
-            args = tool["function"]["arguments"]
-
-            if name == "transfer_call":
+            if tool["function"]["name"] == "transfer_call":
+                args = tool["function"]["arguments"]
                 target = get_lawyer_by_name(system_number, args.get("person_name", ""))
-                result = (
-                    f"Transfer to {target}"
-                    if target else "Lawyer not found"
-                )
-                results.append({"toolCallId": tool["id"], "result": result})
-
+                results.append({
+                    "toolCallId": tool["id"], 
+                    "result": f"Transfer to {target}" if target else "Lawyer not found"
+                })
         return {"results": results}
 
-    if msg_type == "end-of-call-report":
-        call = msg["call"]
-        save_call_log(call)
-
-        appt = call.get("analysis", {}).get("appointment")
-        if appt:
-            save_appointment(
-                call["id"],
-                appt["status"],
-                appt["proposed_time"],
-                appt["attempt"],
-                call["analysis"]["summary"]
-            )
-
-        return {"ok": True}
-
     return {"ignored": True}
-
 # ---------------- REBOOK CALLBACK ----------------
 @app.post("/twilio/rebooking-complete")
 async def rebooking_complete(req: Request):
