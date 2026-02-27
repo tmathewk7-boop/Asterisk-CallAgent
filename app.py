@@ -204,31 +204,31 @@ async def vapi_webhook(request: Request):
 async def combined_vapi_webhook(req: Request):
     payload = await req.json()
     msg = payload.get("message", {})
-    msg_type = msg.get("type")
+    msg_type = msg.get("type", "unknown_type")
+
+    print(f"🔔 VAPI EVENT RECEIVED: {msg_type}")
 
     # This is the event that contains the final phone number and summary
     if msg_type == "end-of-call-report":
-        call = msg.get("call", {})
-        if call:
-            # 1. This function extracts 'customer' -> 'number'
-            save_call_log(call) 
-            
-            # 2. Handle appointments if they exist
-            appt = call.get("analysis", {}).get("appointment")
-            if appt:
-                save_appointment(
-                    call["id"],
-                    appt["status"],
-                    appt["proposed_time"],
-                    appt.get("attempt", 1),
-                    call.get("analysis", {}).get("summary", "")
-                )
-            return {"status": "success"}
+        # CRITICAL FIX: Pass the ENTIRE 'msg' to save_call_log, not just 'call'
+        save_call_log(msg) 
+        
+        # Handle appointments if they exist
+        call_obj = msg.get("call", {})
+        appt = call_obj.get("analysis", {}).get("appointment")
+        if appt:
+            save_appointment(
+                call_obj.get("id"),
+                appt.get("status"),
+                appt.get("proposed_time"),
+                appt.get("attempt", 1),
+                call_obj.get("analysis", {}).get("summary", "")
+            )
+        return {"status": "success"}
 
     # Handle live tool calls (like transfers)
     if msg_type == "tool-calls":
         results = []
-        # Safely get the system number for lawyer lookup
         phone_data = msg.get("call", {}).get("phoneNumber", {})
         system_number = phone_data.get("number")
         
@@ -243,6 +243,7 @@ async def combined_vapi_webhook(req: Request):
         return {"results": results}
 
     return {"ignored": True}
+    
 # ---------------- REBOOK CALLBACK ----------------
 @app.post("/twilio/rebooking-complete")
 async def rebooking_complete(req: Request):
@@ -295,14 +296,16 @@ async def delete_calls(req: DeleteCallsRequest):
 @app.get("/api/calls/{system_number}")
 async def get_calls(system_number: str):
     conn = get_db_connection()
+    if not conn: return []
     try:
         with conn.cursor() as c:
+            # We temporarily removed the 'WHERE system_number=%s' line
+            # so the dashboard will show ALL logs while we debug.
             c.execute("""
                 SELECT * FROM calls
-                WHERE system_number=%s
                 ORDER BY timestamp DESC
                 LIMIT 50
-            """, (system_number,))
+            """)
             return [normalize_call(r) for r in c.fetchall()]
     finally:
         conn.close()
