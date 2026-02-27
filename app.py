@@ -45,11 +45,10 @@ def get_db_connection() -> Optional[pymysql.Connection]:
 
 # ---------------- HELPERS ----------------
 def normalize_call(row: dict) -> dict:
-    """Ensure the dashboard receives 'phone_number' to match its table logic."""
     return {
         "call_sid": row["call_sid"],
         "client_name": row.get("client_name", "Unknown"),
-        "phone_number": row.get("phone_number"), # Changed from 'phone' to 'phone_number'
+        "phone": row.get("phone_number"), # The dashboard expects 'phone'
         "summary": row.get("summary", ""),
         "timestamp": row["timestamp"].strftime("%Y-%m-%d %I:%M %p") if row.get("timestamp") else "N/A"
     }
@@ -83,10 +82,12 @@ def get_lawyer_by_name(system_number: str, name: str) -> Optional[str]:
         conn.close()
 
 # ---------------- CALL STORAGE ----------------
-def save_call_log(message: dict): # Changed parameter from 'call' to 'message'
+def save_call_log(message: dict):
     call = message.get("call", {})
     customer = message.get("customer", {})
-    phone_number_obj = message.get("phoneNumber", {})
+    # Vapi nests your purchased number inside 'phoneNumber'
+    vapi_num_obj = message.get("phoneNumber", {})
+    system_num = vapi_num_obj.get("number", "Unknown") # Capture the +1825...
     
     conn = get_db_connection()
     if not conn: return
@@ -98,22 +99,18 @@ def save_call_log(message: dict): # Changed parameter from 'call' to 'message'
                     timestamp, client_name, summary, full_transcript
                 )
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON DUPLICATE KEY UPDATE
-                    summary=VALUES(summary),
-                    full_transcript=VALUES(full_transcript)
             """, (
                 call.get("id"),
-                customer.get("number"), # Digging into message -> customer -> number
-                phone_number_obj.get("number"), # Digging into message -> phoneNumber -> number
+                customer.get("number"),
+                system_num, # This must be the +1825... for the dashboard filter to work
                 datetime.datetime.now(datetime.timezone.utc),
                 call.get("analysis", {}).get("structuredData", {}).get("client_name", "Unknown"),
                 call.get("analysis", {}).get("summary", ""),
                 call.get("transcript", "")
             ))
         conn.commit()
-        print(f"SUCCESS: Call {call.get('id')} saved to Oracle DB.")
     except Exception as e:
-        print(f"DATABASE ERROR: {e}") # This will show up in Render logs if it fails again
+        print(f"DATABASE INSERT ERROR: {e}")
     finally:
         conn.close()
 
@@ -269,18 +266,21 @@ class DeleteCallsRequest(BaseModel):
 
 @app.post("/api/calls/delete")
 async def delete_calls(req: DeleteCallsRequest):
+    # CRITICAL: Prevent the crash if no IDs are sent
+    if not req.call_sids:
+        return {"ok": True, "message": "No selection to delete"}
+
     conn = get_db_connection()
     if not conn:
-        raise HTTPException(status_code=500, detail="Database connection failed")
+        raise HTTPException(status_code=500, detail="DB Connection Failed")
     
     try:
         with conn.cursor() as c:
-            # We use placeholders to prevent SQL injection
-            format_strings = ','.join(['%s'] * len(req.call_sids))
-            query = f"DELETE FROM calls WHERE call_sid IN ({format_strings})"
-            c.execute(query, tuple(req.call_sids))
+            # Dynamically build the placeholders for the IN clause
+            placeholders = ', '.join(['%s'] * len(req.call_sids))
+            sql = f"DELETE FROM calls WHERE call_sid IN ({placeholders})"
+            c.execute(sql, tuple(req.call_sids))
         conn.commit()
-        print(f"SUCCESS: Deleted {len(req.call_sids)} calls from Oracle.")
         return {"ok": True, "deleted": len(req.call_sids)}
     except Exception as e:
         print(f"DELETE ERROR: {e}")
