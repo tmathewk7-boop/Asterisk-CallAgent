@@ -45,14 +45,11 @@ def get_db_connection() -> Optional[pymysql.Connection]:
 
 # ---------------- HELPERS ----------------
 def normalize_call(row: dict) -> dict:
-    # FIX: In your SQL query 'SELECT *', the column name is 'phone_number'
-    # but this function was looking for 'phone_number' and then trying to 
-    # map it to a key called 'phone'. We need to make sure the dashboard 
-    # receives exactly what it expects.
+    """Ensure the dashboard receives 'phone_number' to match its table logic."""
     return {
         "call_sid": row["call_sid"],
         "client_name": row.get("client_name", "Unknown"),
-        "phone_number": row.get("phone_number", "Unknown"), # Changed key from 'phone' to 'phone_number'
+        "phone_number": row.get("phone_number"), # Changed from 'phone' to 'phone_number'
         "summary": row.get("summary", ""),
         "timestamp": row["timestamp"].strftime("%Y-%m-%d %I:%M %p") if row.get("timestamp") else "N/A"
     }
@@ -86,34 +83,37 @@ def get_lawyer_by_name(system_number: str, name: str) -> Optional[str]:
         conn.close()
 
 # ---------------- CALL STORAGE ----------------
-def save_call_log(call: dict):
+def save_call_log(message: dict): # Changed parameter from 'call' to 'message'
+    call = message.get("call", {})
+    customer = message.get("customer", {})
+    phone_number_obj = message.get("phoneNumber", {})
+    
     conn = get_db_connection()
     if not conn: return
     try:
         with conn.cursor() as c:
-            # We extract the number from Vapi's specific nested JSON path
-            customer_number = call.get("customer", {}).get("number", "Unknown")
-            system_number = call.get("phoneNumber", {}).get("number", "Unknown")
-            
             c.execute("""
                 INSERT INTO calls (
                     call_sid, phone_number, system_number,
                     timestamp, client_name, summary, full_transcript
                 )
-                VALUES (%s,%s,%s,%s,%s,%s,%s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON DUPLICATE KEY UPDATE
                     summary=VALUES(summary),
                     full_transcript=VALUES(full_transcript)
             """, (
-                call["id"],
-                customer_number,
-                system_number,
-                datetime.datetime.utcnow(),
+                call.get("id"),
+                customer.get("number"), # Digging into message -> customer -> number
+                phone_number_obj.get("number"), # Digging into message -> phoneNumber -> number
+                datetime.datetime.now(datetime.timezone.utc),
                 call.get("analysis", {}).get("structuredData", {}).get("client_name", "Unknown"),
                 call.get("analysis", {}).get("summary", ""),
                 call.get("transcript", "")
             ))
         conn.commit()
+        print(f"SUCCESS: Call {call.get('id')} saved to Oracle DB.")
+    except Exception as e:
+        print(f"DATABASE ERROR: {e}") # This will show up in Render logs if it fails again
     finally:
         conn.close()
 
