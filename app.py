@@ -267,6 +267,27 @@ async def rebooking_complete(req: Request):
 class DeleteCallsRequest(BaseModel):
     call_sids: list[str]
 
+@app.post("/api/calls/delete")
+async def delete_calls(req: DeleteCallsRequest):
+    conn = get_db_connection()
+    if not conn:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        with conn.cursor() as c:
+            # We use placeholders to prevent SQL injection
+            format_strings = ','.join(['%s'] * len(req.call_sids))
+            query = f"DELETE FROM calls WHERE call_sid IN ({format_strings})"
+            c.execute(query, tuple(req.call_sids))
+        conn.commit()
+        print(f"SUCCESS: Deleted {len(req.call_sids)} calls from Oracle.")
+        return {"ok": True, "deleted": len(req.call_sids)}
+    except Exception as e:
+        print(f"DELETE ERROR: {e}")
+        return {"ok": False, "error": str(e)}, 500
+    finally:
+        conn.close()
+
 @app.get("/api/calls/{system_number}")
 async def get_calls(system_number: str):
     conn = get_db_connection()
