@@ -149,6 +149,22 @@ def trigger_rebooking_call(call_sid, client_phone, system_number, attempt):
         twiml=twiml
     )
 
+@app.post("/webhook")
+async def vapi_webhook(request: Request):
+    data = await request.json()
+    
+    # Extract the call details Vapi sends
+    call_id = data.get('message', {}).get('call', {}).get('id')
+    phone = data.get('message', {}).get('customer', {}).get('number')
+    status = data.get('message', {}).get('call', {}).get('status')
+    
+    if call_id:
+        # Save to your Oracle MySQL database
+        save_call_to_db(call_id, phone, status)
+        return {"status": "success"}
+    
+    return {"status": "ignored"}
+    
 # ---------------- VAPI WEBHOOK ----------------
 @app.post("/vapi/webhook")
 async def vapi_webhook(req: Request):
