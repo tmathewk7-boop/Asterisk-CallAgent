@@ -196,7 +196,94 @@ async def vapi_webhook(request: Request):
         return {"status": "success"}
     
     return {"status": "ignored"}
+
+# ---------------- APPOINTMENT DASHBOARD ENDPOINTS ----------------
+
+@app.get("/api/schedule/requests/{system_number}")
+async def get_schedule_requests(system_number: str):
+    """Fetches all pending appointments to display on the dashboard calendar."""
+    conn = get_db_connection()
+    if not conn: return []
+    try:
+        with conn.cursor() as c:
+            # We map the database columns to the keys your EventCard expects
+            c.execute("""
+                SELECT call_sid as request_id, 
+                       phone_number as caller_phone,
+                       client_name as caller_name,
+                       timestamp,
+                       appointment_time as requested_time_str,
+                       summary as reason
+                FROM calls
+                WHERE system_number=%s AND appointment_status='pending'
+                ORDER BY timestamp DESC
+            """, (system_number,))
+            return c.fetchall()
+    finally:
+        conn.close()
+
+@app.post("/api/schedule/accept/{call_sid}")
+async def accept_schedule(call_sid: str, req: Request):
+    """Approves the appointment and sends a confirmation SMS."""
+    data = await req.json()
+    caller_phone = data.get("caller_phone")
     
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as c:
+            c.execute("UPDATE calls SET appointment_status='accepted' WHERE call_sid=%s", (call_sid,))
+            
+            # Fetch the time to include in the text message
+            c.execute("SELECT appointment_time FROM calls WHERE call_sid=%s", (call_sid,))
+            row = c.fetchone()
+            appt_time = row['appointment_time'] if row else "your requested time"
+            
+        conn.commit()
+        
+        # Send Confirmation SMS via Twilio
+        if caller_phone:
+            twilio_client.messages.create(
+                body=f"Hello! Your appointment with Wellness Partners for {appt_time} has been confirmed. We look forward to seeing you!",
+                from_=TWILIO_NUMBER, 
+                to=caller_phone
+            )
+        return {"ok": True}
+    except Exception as e:
+        print(f"ACCEPT ERROR: {e}")
+        return {"ok": False, "error": str(e)}
+    finally:
+        conn.close()
+
+@app.post("/api/schedule/reject/{call_sid}")
+async def reject_schedule(call_sid: str):
+    """Rejects the appointment and triggers Riley to call them back."""
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT phone_number, system_number, appointment_attempt 
+                FROM calls WHERE call_sid=%s
+            """, (call_sid,))
+            row = c.fetchone()
+            
+            c.execute("UPDATE calls SET appointment_status='rejected' WHERE call_sid=%s", (call_sid,))
+        conn.commit()
+        
+        # Trigger the AI Callback
+        if row:
+            trigger_rebooking_call(
+                call_sid,
+                row["phone_number"],
+                row["system_number"],
+                row.get("appointment_attempt", 1) + 1
+            )
+        return {"ok": True}
+    except Exception as e:
+        print(f"REJECT ERROR: {e}")
+        return {"ok": False, "error": str(e)}
+    finally:
+        conn.close()
+
 # ---------------- VAPI WEBHOOK ----------------
 # Apply these decorators to catch ALL incoming Vapi signals
 @app.post("/")
