@@ -45,11 +45,12 @@ def get_db_connection() -> Optional[pymysql.Connection]:
 
 # ---------------- HELPERS ----------------
 def normalize_call(row: dict) -> dict:
-    """Renames the database column 'phone_number' to 'phone' for the UI"""
+    """Formats the database row exactly how the Dashboard expects it."""
     return {
-        "call_sid": row["call_sid"],
+        # CRITICAL FIX: Change "call_sid" to "sid" so the dashboard can find the ID to delete it
+        "sid": row["call_sid"], 
         "client_name": row.get("client_name", "Unknown"),
-        "phone": row.get("phone_number"), # The dashboard table looks for 'phone'
+        "phone": row.get("phone_number"), 
         "summary": row.get("summary", ""),
         "timestamp": row["timestamp"].strftime("%Y-%m-%d %I:%M %p") if row.get("timestamp") else "N/A"
     }
