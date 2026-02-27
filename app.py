@@ -158,26 +158,26 @@ def trigger_rebooking_call(call_sid, client_phone, system_number, attempt):
         twiml=twiml
     )
 
-@app.post("/")  # This stops the 'POST / 404' error
+@app.post("/")  # This catches the root POSTs from Vapi seen in your logs
 async def handle_vapi_webhook(request: Request):
-    data = await request.json()
-    
-    # Extracting the info Vapi sends at the end of a call
-    message = data.get('message', {})
-    call_data = message.get('call', {})
-    
-    call_id = call_data.get('id')
-    phone = message.get('customer', {}).get('number')
-    status = call_data.get('status')
-    
-    if call_id:
-        # Save to your Oracle DB (40.233.108.163)
-        # Ensure you use your db connection logic here
-        save_to_db(call_id, phone, status) 
-        print(f"Call {call_id} saved to database.")
-        return {"status": "success"}, 200
-    
-    return {"status": "ignored"}, 200
+    try:
+        data = await request.json()
+        
+        # Extracting the info Vapi sends at the end of a call
+        message = data.get('message', {})
+        call_data = message.get('call', {})
+        
+        # Check if this is the "end-of-call-report" from Vapi
+        if message.get("type") == "end-of-call-report":
+            # FIX: Use 'save_call_log' because 'save_to_db' is not defined in your script
+            save_call_log(call_data)
+            print(f"Call {call_data.get('id')} saved to database.")
+            return {"status": "success"}
+        
+        return {"status": "ignored"}
+    except Exception as e:
+        print(f"Webhook Error: {e}")
+        return {"status": "error", "message": str(e)}, 500
 
 @app.post("/webhook")
 async def vapi_webhook(request: Request):
