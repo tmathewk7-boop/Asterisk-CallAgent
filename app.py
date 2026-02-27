@@ -45,10 +45,11 @@ def get_db_connection() -> Optional[pymysql.Connection]:
 
 # ---------------- HELPERS ----------------
 def normalize_call(row: dict) -> dict:
+    """Renames the database column 'phone_number' to 'phone' for the UI"""
     return {
         "call_sid": row["call_sid"],
         "client_name": row.get("client_name", "Unknown"),
-        "phone": row.get("phone_number"), # The dashboard expects 'phone'
+        "phone": row.get("phone_number"), # The dashboard table looks for 'phone'
         "summary": row.get("summary", ""),
         "timestamp": row["timestamp"].strftime("%Y-%m-%d %I:%M %p") if row.get("timestamp") else "N/A"
     }
@@ -83,11 +84,13 @@ def get_lawyer_by_name(system_number: str, name: str) -> Optional[str]:
 
 # ---------------- CALL STORAGE ----------------
 def save_call_log(message: dict):
+    # Vapi sends the info in the 'message' object
     call = message.get("call", {})
     customer = message.get("customer", {})
-    # Vapi nests your purchased number inside 'phoneNumber'
-    vapi_num_obj = message.get("phoneNumber", {})
-    system_num = vapi_num_obj.get("number", "Unknown") # Capture the +1825...
+    
+    # CRITICAL: This is the exact path to find the number bought from Vapi
+    vapi_phone_obj = message.get("phoneNumber", {})
+    system_num = vapi_phone_obj.get("number", "Unknown") 
     
     conn = get_db_connection()
     if not conn: return
@@ -102,13 +105,14 @@ def save_call_log(message: dict):
             """, (
                 call.get("id"),
                 customer.get("number"),
-                system_num, # This must be the +1825... for the dashboard filter to work
+                system_num, # This will now be '+18254352488' instead of 'Unknown'
                 datetime.datetime.now(datetime.timezone.utc),
                 call.get("analysis", {}).get("structuredData", {}).get("client_name", "Unknown"),
-                call.get("analysis", {}).get("summary", ""),
+                call.get("analysis", {}).get("summary", "No summary"),
                 call.get("transcript", "")
             ))
         conn.commit()
+        print(f"SUCCESS: Saved call from {customer.get('number')} to {system_num}")
     except Exception as e:
         print(f"DATABASE INSERT ERROR: {e}")
     finally:
