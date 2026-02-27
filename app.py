@@ -88,7 +88,13 @@ def save_call_log(message: dict):
     # Vapi sends the info in the 'message' object
     call = message.get("call", {})
     customer = message.get("customer", {})
-    
+    call_id = call.get("id")
+
+    # FAIL-SAFE: Don't try to save to the database if there is no Call ID
+    if not call_id:
+        print("WARNING: Webhook received without a Call ID. Ignoring.")
+        return
+        
     # CRITICAL: This is the exact path to find the number bought from Vapi
     vapi_phone_obj = message.get("phoneNumber", {})
     system_num = vapi_phone_obj.get("number", "Unknown") 
