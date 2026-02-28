@@ -106,7 +106,6 @@ def save_call_log(message: dict):
     system_num = call.get("phoneNumber", {}).get("number", "+18254352488")
     customer_num = call.get("customer", {}).get("number") or message.get("customer", {}).get("number", "Unknown Caller")
     
-    # 🚨 THE CRITICAL FIX: Looking at the top level of 'message', not 'call'
     analysis = message.get("analysis", {})
     artifact = message.get("artifact", {})
     
@@ -134,8 +133,9 @@ def save_call_log(message: dict):
     
     appt_status = "pending" if appt_time else "none"
     
-    # Grab summary
-    summary = analysis.get("summary") or message.get("summary", "No summary provided")
+    # Grab summary and safely truncate it to prevent database crashes
+    raw_summary = analysis.get("summary") or message.get("summary", "No summary provided")
+    safe_summary = raw_summary[:250] + "..." if len(raw_summary) > 250 else raw_summary
     
     conn = get_db_connection()
     if not conn: 
@@ -163,7 +163,7 @@ def save_call_log(message: dict):
                 system_num, 
                 datetime.datetime.now(datetime.timezone.utc),
                 client_name,
-                summary,
+                safe_summary,
                 call.get("transcript", ""),
                 appt_time,
                 appt_status
