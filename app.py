@@ -84,20 +84,42 @@ def get_lawyer_by_name(system_number: str, name: str) -> Optional[str]:
 # ---------------- CALL STORAGE ----------------
 def save_call_log(message: dict):
     call = message.get("call", {})
-    
-    # Safely check both common Vapi locations for the numbers
-    customer_num = call.get("customer", {}).get("number") or message.get("customer", {}).get("number", "Unknown Caller")
-    system_num = call.get("phoneNumber", {}).get("number") or message.get("phoneNumber", {}).get("number", "+18254352488")
+    customer = message.get("customer", {})
     call_id = call.get("id")
 
     if not call_id:
         print("⚠️ WARNING: Webhook received without a Call ID. Ignoring.")
         return
         
-    analysis = call.get("analysis", {})
-    structured = analysis.get("structuredData", {})
+    system_num = call.get("phoneNumber", {}).get("number", "+18254352488")
     
+    # --- DATA EXTRACTION HUNT ---
+    structured = {}
+    
+    # 1. Check the old Vapi "Analysis" folder
+    analysis = call.get("analysis", {})
+    if analysis.get("structuredData"):
+        structured = analysis.get("structuredData")
+        
+    # 2. Check the new Vapi "Structured Outputs" folder (What you just built!)
+    new_outputs = call.get("artifact", {}).get("structuredOutputs", {})
+    if new_outputs:
+        # Vapi sometimes wraps the data inside the name of the output (e.g., "Appointment Booked")
+        for key, val in new_outputs.items():
+            if isinstance(val, dict) and "appointment_time" in val:
+                structured = val
+                break
+        # If it wasn't wrapped, just grab it directly
+        if not structured and isinstance(new_outputs, dict):
+            structured = new_outputs
+
+    # Let's print exactly what we found to the Render logs so we can see it!
+    print(f"🕵️ DATA FOUND: {structured}")
+    
+    # Extract the final values
     appt_time = structured.get("appointment_time") or structured.get("date")
+    client_name = structured.get("client_name") or "Unknown"
+    
     appt_status = "pending" if appt_time else "none"
     
     conn = get_db_connection()
@@ -118,20 +140,21 @@ def save_call_log(message: dict):
                     summary=VALUES(summary),
                     full_transcript=VALUES(full_transcript),
                     appointment_time=VALUES(appointment_time),
-                    appointment_status=VALUES(appointment_status)
+                    appointment_status=VALUES(appointment_status),
+                    client_name=VALUES(client_name)
             """, (
                 call_id,
-                customer_num,
+                customer.get("number", "Unknown Caller"),
                 system_num, 
                 datetime.datetime.now(datetime.timezone.utc),
-                structured.get("client_name", "Unknown"),
+                client_name,
                 analysis.get("summary", "No summary provided"),
                 call.get("transcript", ""),
                 appt_time,
                 appt_status
             ))
         conn.commit()
-        print(f"✅ SUCCESS: Logged call to DB. Appointment: {appt_time}")
+        print(f"✅ SUCCESS: Logged call to DB. Name: {client_name}, Appt: {appt_time}")
     except Exception as e:
         print(f"❌ DATABASE INSERT ERROR: {e}")
     finally:
