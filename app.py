@@ -46,10 +46,8 @@ def get_db_connection() -> Optional[pymysql.Connection]:
 
 # ---------------- HELPERS ----------------
 def normalize_call(row: dict) -> dict:
-    # 1. Clean up the Dashboard Text
     appt_time = row.get("appointment_time")
     
-    # If they booked an appt, show that cleanly. If not, show the AI's summary.
     if appt_time:
         display_request = f"Appointment Request: {appt_time}"
     else:
@@ -59,9 +57,7 @@ def normalize_call(row: dict) -> dict:
         "sid": row["call_sid"], 
         "client_name": row.get("client_name", "Unknown"),
         "phone": row.get("phone_number"), 
-        "summary": display_request, # This pushes the clean text to your UI
-        
-        # Format the timestamp nicely for the UI
+        "summary": display_request, 
         "timestamp": row["timestamp"].strftime("%Y-%m-%d %I:%M %p") if isinstance(row.get("timestamp"), datetime.datetime) else str(row.get("timestamp"))
     }
 
@@ -111,29 +107,41 @@ def save_call_log(message: dict):
     
     structured = {}
     
-    # 1. Check the old Vapi "Analysis" folder
+    # 1. Check old Vapi Analysis Folder
     if analysis.get("structuredData"):
         structured = analysis.get("structuredData")
         
-    # 2. Check the new Vapi "Structured Outputs" folder 
+    # 2. Check new Vapi Structured Outputs folder & dig into the 'result' dict!
     new_outputs = artifact.get("structuredOutputs", {})
     if new_outputs:
         for key, val in new_outputs.items():
-            if isinstance(val, dict) and "appointment_time" in val:
-                structured = val
-                break
+            if isinstance(val, dict):
+                # Dig into the "result" folder where the actual data lives
+                result_data = val.get("result", {})
+                
+                # Parse if it's a string
+                if isinstance(result_data, str):
+                    try:
+                        result_data = json.loads(result_data)
+                    except:
+                        pass
+                
+                # Assign if our properties are found
+                if isinstance(result_data, dict) and "appointment_time" in result_data:
+                    structured = result_data
+                    break
+                    
+        # Fallback if unnested
         if not structured and isinstance(new_outputs, dict):
             structured = new_outputs
 
     print(f"🕵️ DATA FOUND: {structured}")
     
-    # Extract the final values
     appt_time = structured.get("appointment_time") or structured.get("date")
     client_name = structured.get("client_name") or "Unknown"
-    
     appt_status = "pending" if appt_time else "none"
     
-    # Grab summary and safely truncate it to prevent database crashes
+    # Truncate to prevent MySQL DB crashes
     raw_summary = analysis.get("summary") or message.get("summary", "No summary provided")
     safe_summary = raw_summary[:250] + "..." if len(raw_summary) > 250 else raw_summary
     
@@ -158,15 +166,10 @@ def save_call_log(message: dict):
                     appointment_status=VALUES(appointment_status),
                     client_name=VALUES(client_name)
             """, (
-                call_id,
-                customer_num,
-                system_num, 
+                call_id, customer_num, system_num, 
                 datetime.datetime.now(datetime.timezone.utc),
-                client_name,
-                safe_summary,
-                call.get("transcript", ""),
-                appt_time,
-                appt_status
+                client_name, safe_summary, call.get("transcript", ""),
+                appt_time, appt_status
             ))
         conn.commit()
         print(f"✅ SUCCESS: Logged call to DB. Name: {client_name}, Appt: {appt_time}")
@@ -229,7 +232,6 @@ async def main_vapi_webhook(req: Request):
         print(f"🔔 VAPI EVENT RECEIVED: {msg_type}")
 
         if msg_type == "end-of-call-report":
-            # X-RAY DUMP: Print the correct top-level folders
             print("📦 TOP LEVEL FOLDERS:", list(msg.keys()))
             print("📦 RAW ANALYSIS PAYLOAD:")
             print(json.dumps(msg.get("analysis", {}), indent=2))
@@ -314,7 +316,6 @@ async def get_calls(system_number: str):
             rows = c.fetchall()
             
             # 2. Fix the Midnight Sorting Bug
-            # This forces Python to sort by actual chronological time, preventing 12 AM from acting "larger" than 1 AM
             valid_rows = [r for r in rows if isinstance(r.get("timestamp"), datetime.datetime)]
             valid_rows.sort(key=lambda r: r["timestamp"], reverse=True)
             
