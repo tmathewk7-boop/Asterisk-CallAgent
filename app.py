@@ -93,28 +93,28 @@ def save_call_log(message: dict):
         return
         
     system_num = call.get("phoneNumber", {}).get("number", "+18254352488")
+    customer_num = call.get("customer", {}).get("number") or message.get("customer", {}).get("number", "Unknown Caller")
     
-    # --- DATA EXTRACTION HUNT ---
+    # 🚨 THE CRITICAL FIX: Looking at the top level of 'message', not 'call'
+    analysis = message.get("analysis", {})
+    artifact = message.get("artifact", {})
+    
     structured = {}
     
     # 1. Check the old Vapi "Analysis" folder
-    analysis = call.get("analysis", {})
     if analysis.get("structuredData"):
         structured = analysis.get("structuredData")
         
-    # 2. Check the new Vapi "Structured Outputs" folder (What you just built!)
-    new_outputs = call.get("artifact", {}).get("structuredOutputs", {})
+    # 2. Check the new Vapi "Structured Outputs" folder 
+    new_outputs = artifact.get("structuredOutputs", {})
     if new_outputs:
-        # Vapi sometimes wraps the data inside the name of the output (e.g., "Appointment Booked")
         for key, val in new_outputs.items():
             if isinstance(val, dict) and "appointment_time" in val:
                 structured = val
                 break
-        # If it wasn't wrapped, just grab it directly
         if not structured and isinstance(new_outputs, dict):
             structured = new_outputs
 
-    # Let's print exactly what we found to the Render logs so we can see it!
     print(f"🕵️ DATA FOUND: {structured}")
     
     # Extract the final values
@@ -122,6 +122,9 @@ def save_call_log(message: dict):
     client_name = structured.get("client_name") or "Unknown"
     
     appt_status = "pending" if appt_time else "none"
+    
+    # Grab summary
+    summary = analysis.get("summary") or message.get("summary", "No summary provided")
     
     conn = get_db_connection()
     if not conn: 
@@ -145,11 +148,11 @@ def save_call_log(message: dict):
                     client_name=VALUES(client_name)
             """, (
                 call_id,
-                customer.get("number", "Unknown Caller"),
+                customer_num,
                 system_num, 
                 datetime.datetime.now(datetime.timezone.utc),
                 client_name,
-                analysis.get("summary", "No summary provided"),
+                summary,
                 call.get("transcript", ""),
                 appt_time,
                 appt_status
@@ -215,9 +218,12 @@ async def main_vapi_webhook(req: Request):
         print(f"🔔 VAPI EVENT RECEIVED: {msg_type}")
 
         if msg_type == "end-of-call-report":
-            # X-RAY DUMP: Print the exact analysis Vapi sends us
+            # X-RAY DUMP: Print the correct top-level folders
+            print("📦 TOP LEVEL FOLDERS:", list(msg.keys()))
             print("📦 RAW ANALYSIS PAYLOAD:")
-            print(json.dumps(msg.get("call", {}).get("analysis", {}), indent=2))
+            print(json.dumps(msg.get("analysis", {}), indent=2))
+            print("📦 RAW ARTIFACT PAYLOAD:")
+            print(json.dumps(msg.get("artifact", {}), indent=2))
             
             save_call_log(msg) 
             return {"status": "success"}
@@ -397,4 +403,3 @@ async def status():
 # ---------------- RUN ----------------
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
-
