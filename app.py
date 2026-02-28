@@ -46,12 +46,23 @@ def get_db_connection() -> Optional[pymysql.Connection]:
 
 # ---------------- HELPERS ----------------
 def normalize_call(row: dict) -> dict:
+    # 1. Clean up the Dashboard Text
+    appt_time = row.get("appointment_time")
+    
+    # If they booked an appt, show that cleanly. If not, show the AI's summary.
+    if appt_time:
+        display_request = f"Appointment Request: {appt_time}"
+    else:
+        display_request = row.get("summary", "No summary provided")
+        
     return {
         "sid": row["call_sid"], 
         "client_name": row.get("client_name", "Unknown"),
         "phone": row.get("phone_number"), 
-        "summary": row.get("summary", ""),
-        "timestamp": row["timestamp"].strftime("%Y-%m-%d %I:%M %p") if row.get("timestamp") else "N/A"
+        "summary": display_request, # This pushes the clean text to your UI
+        
+        # Format the timestamp nicely for the UI
+        "timestamp": row["timestamp"].strftime("%Y-%m-%d %I:%M %p") if isinstance(row.get("timestamp"), datetime.datetime) else str(row.get("timestamp"))
     }
 
 def get_user_settings(system_number: str) -> dict:
@@ -299,12 +310,15 @@ async def get_calls(system_number: str):
     if not conn: return []
     try:
         with conn.cursor() as c:
-            c.execute("""
-                SELECT * FROM calls
-                ORDER BY timestamp DESC
-                LIMIT 50
-            """)
-            return [normalize_call(r) for r in c.fetchall()]
+            c.execute("SELECT * FROM calls")
+            rows = c.fetchall()
+            
+            # 2. Fix the Midnight Sorting Bug
+            # This forces Python to sort by actual chronological time, preventing 12 AM from acting "larger" than 1 AM
+            valid_rows = [r for r in rows if isinstance(r.get("timestamp"), datetime.datetime)]
+            valid_rows.sort(key=lambda r: r["timestamp"], reverse=True)
+            
+            return [normalize_call(r) for r in valid_rows[:50]]
     finally:
         conn.close()
 
