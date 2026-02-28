@@ -85,43 +85,62 @@ def get_lawyer_by_name(system_number: str, name: str) -> Optional[str]:
 
 # ---------------- CALL STORAGE ----------------
 def save_call_log(message: dict):
-    # Vapi sends the info in the 'message' object
     call = message.get("call", {})
     customer = message.get("customer", {})
     call_id = call.get("id")
 
-    # FAIL-SAFE: Don't try to save to the database if there is no Call ID
+    # FAIL-SAFE: Ignore empty pings
     if not call_id:
-        print("WARNING: Webhook received without a Call ID. Ignoring.")
         return
         
-    # CRITICAL: This is the exact path to find the number bought from Vapi
-    vapi_phone_obj = message.get("phoneNumber", {})
-    system_num = vapi_phone_obj.get("number", "Unknown") 
+    # FIX 1: The system number is inside 'call', not 'message'
+    vapi_phone_obj = call.get("phoneNumber", {})
+    system_num = vapi_phone_obj.get("number") 
+    
+    # Fallback just in case Vapi hides the number, so it ALWAYS shows on your dashboard
+    if not system_num:
+        system_num = "+18254352488"
+
+    # FIX 2: Extract Riley's structured appointment data
+    analysis = call.get("analysis", {})
+    structured = analysis.get("structuredData", {})
+    
+    # Riley usually outputs the date/time here based on your prompt
+    appt_time = structured.get("appointment_time") or structured.get("date")
+    appt_status = "pending" if appt_time else "none"
     
     conn = get_db_connection()
     if not conn: return
     try:
         with conn.cursor() as c:
+            # We insert the call AND the appointment data at the exact same time
             c.execute("""
                 INSERT INTO calls (
                     call_sid, phone_number, system_number,
-                    timestamp, client_name, summary, full_transcript
+                    timestamp, client_name, summary, full_transcript,
+                    appointment_time, appointment_status
                 )
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON DUPLICATE KEY UPDATE
+                    summary=VALUES(summary),
+                    full_transcript=VALUES(full_transcript),
+                    appointment_time=VALUES(appointment_time),
+                    appointment_status=VALUES(appointment_status)
             """, (
-                call.get("id"),
-                customer.get("number"),
-                system_num, # This will now be '+18254352488' instead of 'Unknown'
+                call_id,
+                customer.get("number", "Unknown Caller"),
+                system_num, 
                 datetime.datetime.now(datetime.timezone.utc),
-                call.get("analysis", {}).get("structuredData", {}).get("client_name", "Unknown"),
-                call.get("analysis", {}).get("summary", "No summary"),
-                call.get("transcript", "")
+                structured.get("client_name", "Unknown"),
+                analysis.get("summary", "No summary provided"),
+                call.get("transcript", ""),
+                appt_time,
+                appt_status
             ))
         conn.commit()
-        print(f"SUCCESS: Saved call from {customer.get('number')} to {system_num}")
+        print(f"✅ SUCCESS: Logged call to {system_num}. Appt Time: {appt_time}")
     except Exception as e:
-        print(f"DATABASE INSERT ERROR: {e}")
+        print(f"❌ DATABASE INSERT ERROR: {e}")
     finally:
         conn.close()
 
