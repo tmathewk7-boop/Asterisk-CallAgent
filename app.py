@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from twilio.rest import Client
 import uvicorn
+import json
 
 # ---------------- CONFIG ----------------
 PORT = int(os.getenv("PORT", 8000))
@@ -214,6 +215,10 @@ async def main_vapi_webhook(req: Request):
         print(f"🔔 VAPI EVENT RECEIVED: {msg_type}")
 
         if msg_type == "end-of-call-report":
+            # X-RAY DUMP: Print the exact analysis Vapi sends us
+            print("📦 RAW ANALYSIS PAYLOAD:")
+            print(json.dumps(msg.get("call", {}).get("analysis", {}), indent=2))
+            
             save_call_log(msg) 
             return {"status": "success"}
 
