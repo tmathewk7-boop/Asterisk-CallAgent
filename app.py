@@ -45,9 +45,7 @@ def get_db_connection() -> Optional[pymysql.Connection]:
 
 # ---------------- HELPERS ----------------
 def normalize_call(row: dict) -> dict:
-    """Formats the database row exactly how the Dashboard expects it."""
     return {
-        # CRITICAL FIX: Change "call_sid" to "sid" so the dashboard can find the ID to delete it
         "sid": row["call_sid"], 
         "client_name": row.get("client_name", "Unknown"),
         "phone": row.get("phone_number"), 
@@ -86,34 +84,29 @@ def get_lawyer_by_name(system_number: str, name: str) -> Optional[str]:
 # ---------------- CALL STORAGE ----------------
 def save_call_log(message: dict):
     call = message.get("call", {})
-    customer = message.get("customer", {})
+    
+    # Safely check both common Vapi locations for the numbers
+    customer_num = call.get("customer", {}).get("number") or message.get("customer", {}).get("number", "Unknown Caller")
+    system_num = call.get("phoneNumber", {}).get("number") or message.get("phoneNumber", {}).get("number", "+18254352488")
     call_id = call.get("id")
 
-    # FAIL-SAFE: Ignore empty pings
     if not call_id:
+        print("⚠️ WARNING: Webhook received without a Call ID. Ignoring.")
         return
         
-    # FIX 1: The system number is inside 'call', not 'message'
-    vapi_phone_obj = call.get("phoneNumber", {})
-    system_num = vapi_phone_obj.get("number") 
-    
-    # Fallback just in case Vapi hides the number, so it ALWAYS shows on your dashboard
-    if not system_num:
-        system_num = "+18254352488"
-
-    # FIX 2: Extract Riley's structured appointment data
     analysis = call.get("analysis", {})
     structured = analysis.get("structuredData", {})
     
-    # Riley usually outputs the date/time here based on your prompt
     appt_time = structured.get("appointment_time") or structured.get("date")
     appt_status = "pending" if appt_time else "none"
     
     conn = get_db_connection()
-    if not conn: return
+    if not conn: 
+        print("❌ ERROR: Database connection failed.")
+        return
+        
     try:
         with conn.cursor() as c:
-            # We insert the call AND the appointment data at the exact same time
             c.execute("""
                 INSERT INTO calls (
                     call_sid, phone_number, system_number,
@@ -128,7 +121,7 @@ def save_call_log(message: dict):
                     appointment_status=VALUES(appointment_status)
             """, (
                 call_id,
-                customer.get("number", "Unknown Caller"),
+                customer_num,
                 system_num, 
                 datetime.datetime.now(datetime.timezone.utc),
                 structured.get("client_name", "Unknown"),
@@ -138,7 +131,7 @@ def save_call_log(message: dict):
                 appt_status
             ))
         conn.commit()
-        print(f"✅ SUCCESS: Logged call to {system_num}. Appt Time: {appt_time}")
+        print(f"✅ SUCCESS: Logged call to DB. Appointment: {appt_time}")
     except Exception as e:
         print(f"❌ DATABASE INSERT ERROR: {e}")
     finally:
@@ -166,7 +159,7 @@ def trigger_rebooking_call(call_sid, client_phone, system_number, attempt):
         return
 
     settings = get_user_settings(system_number)
-    greeting = settings.get("greeting", "The lawyer is unavailable.")
+    greeting = settings.get("greeting", "The clinic is currently unavailable.")
 
     twiml = f"""
     <Response>
@@ -185,178 +178,40 @@ def trigger_rebooking_call(call_sid, client_phone, system_number, attempt):
         twiml=twiml
     )
 
-@app.post("/")  # This catches the root POSTs from Vapi seen in your logs
-async def handle_vapi_webhook(request: Request):
-    try:
-        data = await request.json()
-        
-        # Extracting the info Vapi sends at the end of a call
-        message = data.get('message', {})
-        call_data = message.get('call', {})
-        
-        # Check if this is the "end-of-call-report" from Vapi
-        if message.get("type") == "end-of-call-report":
-            # FIX: Use 'save_call_log' because 'save_to_db' is not defined in your script
-            save_call_log(call_data)
-            print(f"Call {call_data.get('id')} saved to database.")
-            return {"status": "success"}
-        
-        return {"status": "ignored"}
-    except Exception as e:
-        print(f"Webhook Error: {e}")
-        return {"status": "error", "message": str(e)}, 500
-
-@app.post("/webhook")
-async def vapi_webhook(request: Request):
-    data = await request.json()
-    
-    # Extract the call details Vapi sends
-    call_id = data.get('message', {}).get('call', {}).get('id')
-    phone = data.get('message', {}).get('customer', {}).get('number')
-    status = data.get('message', {}).get('call', {}).get('status')
-    
-    if call_id:
-        # Save to your Oracle MySQL database
-        save_call_to_db(call_id, phone, status)
-        return {"status": "success"}
-    
-    return {"status": "ignored"}
-
-# ---------------- APPOINTMENT DASHBOARD ENDPOINTS ----------------
-
-@app.get("/api/schedule/requests/{system_number}")
-async def get_schedule_requests(system_number: str):
-    """Fetches all pending appointments to display on the dashboard calendar."""
-    conn = get_db_connection()
-    if not conn: return []
-    try:
-        with conn.cursor() as c:
-            # We map the database columns to the keys your EventCard expects
-            c.execute("""
-                SELECT call_sid as request_id, 
-                       phone_number as caller_phone,
-                       client_name as caller_name,
-                       timestamp,
-                       appointment_time as requested_time_str,
-                       summary as reason
-                FROM calls
-                WHERE system_number=%s AND appointment_status='pending'
-                ORDER BY timestamp DESC
-            """, (system_number,))
-            return c.fetchall()
-    finally:
-        conn.close()
-
-@app.post("/api/schedule/accept/{call_sid}")
-async def accept_schedule(call_sid: str, req: Request):
-    """Approves the appointment and sends a confirmation SMS."""
-    data = await req.json()
-    caller_phone = data.get("caller_phone")
-    
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as c:
-            c.execute("UPDATE calls SET appointment_status='accepted' WHERE call_sid=%s", (call_sid,))
-            
-            # Fetch the time to include in the text message
-            c.execute("SELECT appointment_time FROM calls WHERE call_sid=%s", (call_sid,))
-            row = c.fetchone()
-            appt_time = row['appointment_time'] if row else "your requested time"
-            
-        conn.commit()
-        
-        # Send Confirmation SMS via Twilio
-        if caller_phone:
-            twilio_client.messages.create(
-                body=f"Hello! Your appointment with Wellness Partners for {appt_time} has been confirmed. We look forward to seeing you!",
-                from_=TWILIO_NUMBER, 
-                to=caller_phone
-            )
-        return {"ok": True}
-    except Exception as e:
-        print(f"ACCEPT ERROR: {e}")
-        return {"ok": False, "error": str(e)}
-    finally:
-        conn.close()
-
-@app.post("/api/schedule/reject/{call_sid}")
-async def reject_schedule(call_sid: str):
-    """Rejects the appointment and triggers Riley to call them back."""
-    conn = get_db_connection()
-    try:
-        with conn.cursor() as c:
-            c.execute("""
-                SELECT phone_number, system_number, appointment_attempt 
-                FROM calls WHERE call_sid=%s
-            """, (call_sid,))
-            row = c.fetchone()
-            
-            c.execute("UPDATE calls SET appointment_status='rejected' WHERE call_sid=%s", (call_sid,))
-        conn.commit()
-        
-        # Trigger the AI Callback
-        if row:
-            trigger_rebooking_call(
-                call_sid,
-                row["phone_number"],
-                row["system_number"],
-                row.get("appointment_attempt", 1) + 1
-            )
-        return {"ok": True}
-    except Exception as e:
-        print(f"REJECT ERROR: {e}")
-        return {"ok": False, "error": str(e)}
-    finally:
-        conn.close()
-
-# ---------------- VAPI WEBHOOK ----------------
-# Apply these decorators to catch ALL incoming Vapi signals
+# ---------------- MAIN VAPI WEBHOOK ----------------
 @app.post("/")
 @app.post("/webhook")
 @app.post("/vapi/webhook")
-async def combined_vapi_webhook(req: Request):
-    payload = await req.json()
-    msg = payload.get("message", {})
-    msg_type = msg.get("type", "unknown_type")
+async def main_vapi_webhook(req: Request):
+    try:
+        payload = await req.json()
+        msg = payload.get("message", {})
+        msg_type = msg.get("type", "unknown_type")
 
-    print(f"🔔 VAPI EVENT RECEIVED: {msg_type}")
+        print(f"🔔 VAPI EVENT RECEIVED: {msg_type}")
 
-    # This is the event that contains the final phone number and summary
-    if msg_type == "end-of-call-report":
-        # CRITICAL FIX: Pass the ENTIRE 'msg' to save_call_log, not just 'call'
-        save_call_log(msg) 
-        
-        # Handle appointments if they exist
-        call_obj = msg.get("call", {})
-        appt = call_obj.get("analysis", {}).get("appointment")
-        if appt:
-            save_appointment(
-                call_obj.get("id"),
-                appt.get("status"),
-                appt.get("proposed_time"),
-                appt.get("attempt", 1),
-                call_obj.get("analysis", {}).get("summary", "")
-            )
-        return {"status": "success"}
+        if msg_type == "end-of-call-report":
+            save_call_log(msg) 
+            return {"status": "success"}
 
-    # Handle live tool calls (like transfers)
-    if msg_type == "tool-calls":
-        results = []
-        phone_data = msg.get("call", {}).get("phoneNumber", {})
-        system_number = phone_data.get("number")
-        
-        for tool in msg.get("toolCalls", []):
-            if tool["function"]["name"] == "transfer_call":
-                args = tool["function"]["arguments"]
-                target = get_lawyer_by_name(system_number, args.get("person_name", ""))
-                results.append({
-                    "toolCallId": tool["id"], 
-                    "result": f"Transfer to {target}" if target else "Lawyer not found"
-                })
-        return {"results": results}
+        if msg_type == "tool-calls":
+            results = []
+            system_number = msg.get("call", {}).get("phoneNumber", {}).get("number")
+            for tool in msg.get("toolCalls", []):
+                if tool["function"]["name"] == "transfer_call":
+                    args = tool["function"]["arguments"]
+                    target = get_lawyer_by_name(system_number, args.get("person_name", ""))
+                    results.append({
+                        "toolCallId": tool["id"], 
+                        "result": f"Transfer to {target}" if target else "Lawyer not found"
+                    })
+            return {"results": results}
 
-    return {"ignored": True}
-    
+        return {"ignored": True}
+    except Exception as e:
+        print(f"❌ WEBHOOK CRASH: {e}")
+        return {"status": "error"}, 500
+
 # ---------------- REBOOK CALLBACK ----------------
 @app.post("/twilio/rebooking-complete")
 async def rebooking_complete(req: Request):
@@ -365,8 +220,8 @@ async def rebooking_complete(req: Request):
     attempt = int(req.query_params["attempt"])
     system_number = req.query_params["system_number"]
 
-    transcript = "Client requested new time"  # plug your transcription here
-    new_time = "TBD"                            # plug NLP extraction here
+    transcript = "Client requested new time" 
+    new_time = "TBD" 
 
     save_appointment(
         call_sid,
@@ -378,13 +233,12 @@ async def rebooking_complete(req: Request):
 
     return {"ok": True}
 
-# ---------------- DASHBOARD API ----------------
+# ---------------- DASHBOARD API ENDPOINTS ----------------
 class DeleteCallsRequest(BaseModel):
     call_sids: list[str]
 
 @app.post("/api/calls/delete")
 async def delete_calls(req: DeleteCallsRequest):
-    # CRITICAL: Prevent the crash if no IDs are sent
     if not req.call_sids:
         return {"ok": True, "message": "No selection to delete"}
 
@@ -394,7 +248,6 @@ async def delete_calls(req: DeleteCallsRequest):
     
     try:
         with conn.cursor() as c:
-            # Dynamically build the placeholders for the IN clause
             placeholders = ', '.join(['%s'] * len(req.call_sids))
             sql = f"DELETE FROM calls WHERE call_sid IN ({placeholders})"
             c.execute(sql, tuple(req.call_sids))
@@ -412,8 +265,6 @@ async def get_calls(system_number: str):
     if not conn: return []
     try:
         with conn.cursor() as c:
-            # We temporarily removed the 'WHERE system_number=%s' line
-            # so the dashboard will show ALL logs while we debug.
             c.execute("""
                 SELECT * FROM calls
                 ORDER BY timestamp DESC
@@ -423,36 +274,92 @@ async def get_calls(system_number: str):
     finally:
         conn.close()
 
+@app.get("/api/schedule/requests/{system_number}")
+async def get_schedule_requests(system_number: str):
+    conn = get_db_connection()
+    if not conn: return []
+    try:
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT call_sid as request_id, 
+                       phone_number as caller_phone,
+                       client_name as caller_name,
+                       timestamp,
+                       appointment_time as requested_time_str,
+                       summary as reason
+                FROM calls
+                WHERE appointment_status='pending'
+                ORDER BY timestamp DESC
+            """)
+            return c.fetchall()
+    finally:
+        conn.close()
+
+@app.post("/api/schedule/accept/{call_sid}")
+async def accept_schedule(call_sid: str, req: Request):
+    data = await req.json()
+    caller_phone = data.get("caller_phone")
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as c:
+            c.execute("UPDATE calls SET appointment_status='accepted' WHERE call_sid=%s", (call_sid,))
+            c.execute("SELECT appointment_time FROM calls WHERE call_sid=%s", (call_sid,))
+            row = c.fetchone()
+            appt_time = row['appointment_time'] if row else "your requested time"
+        conn.commit()
+        
+        if caller_phone:
+            twilio_client.messages.create(
+                body=f"Hello! Your appointment with Wellness Partners for {appt_time} has been confirmed. We look forward to seeing you!",
+                from_=TWILIO_NUMBER, 
+                to=caller_phone
+            )
+        return {"ok": True}
+    except Exception as e:
+        print(f"ACCEPT ERROR: {e}")
+        return {"ok": False, "error": str(e)}
+    finally:
+        conn.close()
+
+@app.post("/api/schedule/reject/{call_sid}")
+async def reject_schedule(call_sid: str):
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as c:
+            c.execute("""
+                SELECT phone_number, system_number, appointment_attempt 
+                FROM calls WHERE call_sid=%s
+            """, (call_sid,))
+            row = c.fetchone()
+            c.execute("UPDATE calls SET appointment_status='rejected' WHERE call_sid=%s", (call_sid,))
+        conn.commit()
+        
+        if row:
+            trigger_rebooking_call(
+                call_sid,
+                row["phone_number"],
+                row["system_number"],
+                row.get("appointment_attempt", 1) + 1
+            )
+        return {"ok": True}
+    except Exception as e:
+        print(f"REJECT ERROR: {e}")
+        return {"ok": False, "error": str(e)}
+    finally:
+        conn.close()
+
 @app.post("/api/calls/update")
 async def update_call(req: Request):
     data = await req.json()
     call_sid = data["call_sid"]
     status = data["appointment_status"]
-
     conn = get_db_connection()
     try:
         with conn.cursor() as c:
-            c.execute("""
-                SELECT phone_number, system_number, appointment_attempt
-                FROM calls WHERE call_sid=%s
-            """, (call_sid,))
-            row = c.fetchone()
-
-            c.execute("""
-                UPDATE calls SET appointment_status=%s WHERE call_sid=%s
-            """, (status, call_sid))
+            c.execute("UPDATE calls SET appointment_status=%s WHERE call_sid=%s", (status, call_sid))
         conn.commit()
     finally:
         conn.close()
-
-    if status == "rejected":
-        trigger_rebooking_call(
-            call_sid,
-            row["phone_number"],
-            row["system_number"],
-            row["appointment_attempt"] + 1
-        )
-
     return {"ok": True}
 
 @app.get("/status")
