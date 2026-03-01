@@ -18,3 +18,5 @@ speechrecognition
 google-generativeai
 httpx
 pymysql
+openai
+pydantic
