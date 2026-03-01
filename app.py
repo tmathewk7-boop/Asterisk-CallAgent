@@ -88,11 +88,13 @@ def trigger_rebooking_call(call_sid, client_phone, system_number, attempt):
     if attempt > 5: return
     settings = get_user_settings(system_number)
     greeting = settings.get("greeting", "The clinic is currently unavailable.")
+    
+    # We use TwiML to tell the client the time was rejected and ask for a new one
     twiml = f"""
     <Response>
-        <Say>{greeting}</Say>
-        <Say>Please state another time that works.</Say>
-        <Record maxLength="20" action="{PUBLIC_URL}/twilio/rebooking-complete?call_sid={call_sid}&attempt={attempt}&system_number={system_number}" />
+        <Say>I'm sorry, that time is no longer available.</Say>
+        <Say>Please stay on the line and tell me another time that works for you.</Say>
+        <Redirect>{PUBLIC_URL}/voice/incoming?From={client_phone}&To={system_number}</Redirect>
     </Response>
     """
     twilio_client.calls.create(to=client_phone, from_=TWILIO_NUMBER, twiml=twiml)
@@ -337,17 +339,28 @@ async def accept_schedule(call_sid: str, req: Request):
 @app.post("/api/schedule/reject/{call_sid}")
 async def reject_schedule(call_sid: str):
     conn = get_db_connection()
+    if not conn:
+        return {"ok": False, "error": "Database connection failed"}
     try:
         with conn.cursor() as c:
+            # Get the caller's info before we update the status
             c.execute("SELECT phone_number, system_number FROM calls WHERE call_sid=%s", (call_sid,))
             row = c.fetchone()
+            
+            # Update the status to rejected in the DB
             c.execute("UPDATE calls SET appointment_status='rejected' WHERE call_sid=%s", (call_sid,))
         conn.commit()
-        if row: # Physically trigger the phone call!
+        
+        # If we found the caller, physically trigger the rebooking call
+        if row:
             trigger_rebooking_call(call_sid, row["phone_number"], row["system_number"], 1)
+            
         return {"ok": True}
-    finally: conn.close()
-
+    except Exception as e:
+        print(f"❌ REJECT ERROR: {e}")
+        return {"ok": False, "error": str(e)}
+    finally:
+        conn.close()
 @app.post("/api/calls/update")
 async def update_call(req: Request):
     data = await req.json()
