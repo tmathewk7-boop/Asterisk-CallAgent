@@ -84,6 +84,19 @@ def get_user_settings(system_number: str) -> dict:
         if conn:
             conn.close()
 
+def trigger_rebooking_call(call_sid, client_phone, system_number, attempt):
+    if attempt > 5: return
+    settings = get_user_settings(system_number)
+    greeting = settings.get("greeting", "The clinic is currently unavailable.")
+    twiml = f"""
+    <Response>
+        <Say>{greeting}</Say>
+        <Say>Please state another time that works.</Say>
+        <Record maxLength="20" action="{PUBLIC_URL}/twilio/rebooking-complete?call_sid={call_sid}&attempt={attempt}&system_number={system_number}" />
+    </Response>
+    """
+    twilio_client.calls.create(to=client_phone, from_=TWILIO_NUMBER, twiml=twiml)
+
 # ---------------- THE FREE MICROSOFT NEURAL TTS HACK ----------------
 @app.get("/voice/tts")
 async def get_edge_tts(text: str):
@@ -128,8 +141,9 @@ async def handle_incoming_call(CallSid: str = Form(...), From: str = Form(...), 
     # Convert greeting to realistic human audio
     encoded_greeting = urllib.parse.quote(greeting)
     response = VoiceResponse()
-    response.play(f"{PUBLIC_URL}/voice/tts?text={encoded_greeting}")
-    response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="auto")
+    # Nesting Play inside Gather allows for instant human interruption (Barge-In)
+    gather = response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="auto", bargeIn="true")
+    gather.play(f"{PUBLIC_URL}/voice/tts?text={encoded_reply}") # Or encoded_greeting for the incoming route
     
     return HTMLResponse(content=str(response), media_type="application/xml")
 
@@ -167,8 +181,9 @@ async def process_speech(CallSid: str = Form(...), SpeechResult: str = Form(None
 
         # Convert AI reply to realistic human audio
         encoded_reply = urllib.parse.quote(ai_reply)
-        response.play(f"{PUBLIC_URL}/voice/tts?text={encoded_reply}")
-        response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="auto")
+        # Nesting Play inside Gather allows for instant human interruption (Barge-In)
+        gather = response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="auto", bargeIn="true")
+        gather.play(f"{PUBLIC_URL}/voice/tts?text={encoded_reply}") # Or encoded_greeting for the incoming route
         
     except Exception as e:
         print(f"❌ Groq Error: {e}")
@@ -193,12 +208,17 @@ async def call_status_update(CallSid: str = Form(...), CallStatus: str = Form(..
         print(f"📞 CALL ENDED. Extracting data...\n")
 
         try:
+            current_date = datetime.datetime.now().strftime('%Y-%m-%d')
+        
             extraction_prompt = f"""
-            Read the following call transcript. Extract the caller's full name and the appointment time they requested.
-            Even if the appointment was not fully confirmed, extract whatever they asked for.
+            Today's date is {current_date}. Read the following call transcript. 
+            Extract the caller's full name and the specific appointment time they requested.
+        
+            CRITICAL: Format the "appointment_time" strictly as "YYYY-MM-DD HH:MM AM/PM". 
+            Do not use conversational dates like "next Wednesday". Calculate the exact date.
+        
             Return ONLY a valid JSON object with the exact keys: "client_name", "appointment_time", and "summary".
-            If a value is not mentioned, return null. Do not add any markdown formatting.
-            
+        
             Transcript:
             {transcript}
             """
@@ -319,8 +339,12 @@ async def reject_schedule(call_sid: str):
     conn = get_db_connection()
     try:
         with conn.cursor() as c:
+            c.execute("SELECT phone_number, system_number FROM calls WHERE call_sid=%s", (call_sid,))
+            row = c.fetchone()
             c.execute("UPDATE calls SET appointment_status='rejected' WHERE call_sid=%s", (call_sid,))
         conn.commit()
+        if row: # Physically trigger the phone call!
+            trigger_rebooking_call(call_sid, row["phone_number"], row["system_number"], 1)
         return {"ok": True}
     finally: conn.close()
 
@@ -368,6 +392,20 @@ async def save_customization(req: Request):
     except Exception as e:
         print(f"❌ CUSTOMIZATION SAVE ERROR: {e}")
         return {"ok": False, "error": str(e)}
+
+@app.post("/twilio/rebooking-complete")
+async def rebooking_complete(req: Request):
+    call_sid = req.query_params["call_sid"]
+    attempt = int(req.query_params["attempt"])
+    conn = get_db_connection()
+    try:
+        with conn.cursor() as c:
+            c.execute("""
+                UPDATE calls SET appointment_status='pending', appointment_time='TBD', summary=%s WHERE call_sid=%s
+            """, (f"Rebooking attempt {attempt}: Client requested new time", call_sid))
+        conn.commit()
+    finally: conn.close()
+    return {"ok": True}
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
