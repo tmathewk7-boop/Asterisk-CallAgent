@@ -9,7 +9,7 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from pydantic import BaseModel
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
-from openai import AsyncOpenAI
+from groq import AsyncGroq
 import uvicorn
 
 # ---------------- CONFIG ----------------
@@ -19,10 +19,10 @@ PUBLIC_URL = os.getenv("PUBLIC_URL")
 TWILIO_SID = os.getenv("TWILIO_SID")
 TWILIO_AUTH = os.getenv("TWILIO_AUTH")
 TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 
 twilio_client = Client(TWILIO_SID, TWILIO_AUTH)
-openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY)
+groq_client = AsyncGroq(api_key=GROQ_API_KEY)
 
 # ---------------- APP ----------------
 app = FastAPI()
@@ -80,7 +80,8 @@ def get_user_settings(system_number: str) -> dict:
             """, (system_number,))
             return c.fetchone() or {}
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 # ---------------- 1. INCOMING CALL (TWILIO WEBHOOK) ----------------
 @app.post("/voice/incoming")
@@ -141,10 +142,10 @@ async def process_speech(CallSid: str = Form(...), SpeechResult: str = Form(None
     # Add user speech to memory
     history.append({"role": "user", "content": SpeechResult})
 
-    # Ask OpenAI how to reply
+    # Ask Groq how to reply
     try:
-        ai_completion = await openai_client.chat.completions.create(
-            model="gpt-4o-mini",
+        ai_completion = await groq_client.chat.completions.create(
+            model="llama3-8b-8192", # Free, blazing fast model
             messages=history
         )
         ai_reply = ai_completion.choices[0].message.content
@@ -158,7 +159,7 @@ async def process_speech(CallSid: str = Form(...), SpeechResult: str = Form(None
         response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="auto")
         
     except Exception as e:
-        print(f"❌ OpenAI Error: {e}")
+        print(f"❌ Groq Error: {e}")
         response.say("I'm having a little trouble connecting. Please hold.", voice="Polly.Joanna-Neural")
 
     return HTMLResponse(content=str(response), media_type="application/xml")
@@ -179,37 +180,22 @@ async def call_status_update(CallSid: str = Form(...), CallStatus: str = Form(..
         transcript = "\n".join([f"{msg['role'].upper()}: {msg['content']}" for msg in history if msg['role'] != 'system'])
         print(f"📞 CALL ENDED. Extracting data...\n")
 
-        # --- FORCE OPENAI TO EXTRACT THE DATA (Bypassing Vapi completely) ---
+        # --- FORCE GROQ TO EXTRACT THE DATA IN JSON MODE ---
         try:
             extraction_prompt = f"""
             Read the following call transcript. Extract the caller's full name and the appointment time they requested.
             Even if the appointment was not fully confirmed, extract whatever they asked for.
-            If a value is not mentioned, return null.
+            Return ONLY a valid JSON object with the exact keys: "client_name", "appointment_time", and "summary".
+            If a value is not mentioned, return null. Do not add any markdown formatting.
             
             Transcript:
             {transcript}
             """
             
-            ext_completion = await openai_client.chat.completions.create(
-                model="gpt-4o-mini",
+            ext_completion = await groq_client.chat.completions.create(
+                model="llama3-8b-8192",
                 messages=[{"role": "user", "content": extraction_prompt}],
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": "appointment_data",
-                        "schema": {
-                            "type": "object",
-                            "properties": {
-                                "client_name": {"type": ["string", "null"]},
-                                "appointment_time": {"type": ["string", "null"]},
-                                "summary": {"type": "string", "description": "A 1-sentence summary of the call"}
-                            },
-                            "required": ["client_name", "appointment_time", "summary"],
-                            "additionalProperties": False
-                        },
-                        "strict": True
-                    }
-                }
+                response_format={"type": "json_object"}
             )
             
             data = json.loads(ext_completion.choices[0].message.content)
@@ -312,7 +298,7 @@ async def accept_schedule(call_sid: str, req: Request):
         conn.commit()
         if caller_phone:
             twilio_client.messages.create(
-                body=f"Your appointment with Wellness Partners for {appt_time} is confirmed.",
+                body=f"Your appointment with Verity Law for {appt_time} is confirmed.",
                 from_=TWILIO_NUMBER, to=caller_phone
             )
         return {"ok": True}
