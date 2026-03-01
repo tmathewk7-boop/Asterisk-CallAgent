@@ -143,7 +143,7 @@ async def handle_incoming_call(CallSid: str = Form(...), From: str = Form(...), 
     response = VoiceResponse()
     # Nesting Play inside Gather allows for instant human interruption (Barge-In)
     gather = response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="auto", bargeIn="true")
-    gather.play(f"{PUBLIC_URL}/voice/tts?text={encoded_reply}") # Or encoded_greeting for the incoming route
+    gather.play(f"{PUBLIC_URL}/voice/tts?text={encoded_greetin}") # Or encoded_greeting for the incoming route
     
     return HTMLResponse(content=str(response), media_type="application/xml")
 
