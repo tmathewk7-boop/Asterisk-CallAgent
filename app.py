@@ -342,5 +342,36 @@ async def update_call(req: Request):
 @app.get("/status")
 async def status(): return {"status": "online"}
 
+@app.post("/api/settings")
+async def save_customization(req: Request):
+    try:
+        data = await req.json()
+        
+        # Default to your system number if the frontend doesn't pass it
+        system_number = data.get("system_number", "+18254352488") 
+        system_prompt = data.get("system_prompt", "")
+        greeting = data.get("greeting", "Hello, how can I help you today?")
+        ai_active = data.get("ai_active", 1) 
+
+        conn = get_db_connection()
+        if not conn:
+            return {"ok": False, "error": "Database connection failed"}
+            
+        with conn.cursor() as c:
+            c.execute("""
+                UPDATE users 
+                SET system_prompt=%s, greeting=%s, ai_active=%s 
+                WHERE phone_number=%s
+            """, (system_prompt, greeting, ai_active, system_number))
+        conn.commit()
+        conn.close()
+        
+        print(f"✅ CUSTOMIZATION SAVED: {greeting[:30]}...")
+        return {"ok": True}
+        
+    except Exception as e:
+        print(f"❌ CUSTOMIZATION SAVE ERROR: {e}")
+        return {"ok": False, "error": str(e)}
+
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=PORT)
