@@ -145,7 +145,7 @@ async def process_speech(CallSid: str = Form(...), SpeechResult: str = Form(None
     # Ask Groq how to reply
     try:
         ai_completion = await groq_client.chat.completions.create(
-            model="llama3-8b-8192", # Free, blazing fast model
+            model="llama-3.1-8b-instant", # Free, blazing fast model
             messages=history
         )
         ai_reply = ai_completion.choices[0].message.content
