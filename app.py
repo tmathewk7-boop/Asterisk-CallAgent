@@ -2,14 +2,16 @@ import os
 import datetime
 import pymysql
 import json
+import urllib.parse
 from typing import Optional, Dict, Any, List
 from fastapi import FastAPI, Request, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 from pydantic import BaseModel
 from twilio.rest import Client
 from twilio.twiml.voice_response import VoiceResponse
 from groq import AsyncGroq
+import edge_tts
 import uvicorn
 
 # ---------------- CONFIG ----------------
@@ -34,7 +36,6 @@ app.add_middleware(
 )
 
 # In-memory storage for active call transcripts
-# Maps CallSid -> List of message dictionaries
 active_calls: Dict[str, List[dict]] = {}
 
 # ---------------- DB ----------------
@@ -83,29 +84,40 @@ def get_user_settings(system_number: str) -> dict:
         if conn:
             conn.close()
 
+# ---------------- THE FREE MICROSOFT NEURAL TTS HACK ----------------
+@app.get("/voice/tts")
+async def get_edge_tts(text: str):
+    """Twilio hits this to get ultra-realistic audio for $0."""
+    # We are using Microsoft's 'Ava' voice, which sounds highly realistic
+    voice = "en-US-AvaNeural" 
+    communicate = edge_tts.Communicate(text, voice)
+    
+    audio_data = b""
+    async for chunk in communicate.stream():
+        if chunk["type"] == "audio":
+            audio_data += chunk["data"]
+            
+    return Response(content=audio_data, media_type="audio/mpeg")
+
 # ---------------- 1. INCOMING CALL (TWILIO WEBHOOK) ----------------
 @app.post("/voice/incoming")
 async def handle_incoming_call(CallSid: str = Form(...), From: str = Form(...), To: str = Form(...)):
     """Triggered by Twilio when someone calls your system number."""
     
-    # 🚨 DYNAMIC INJECTION: Fetch from your Dashboard's Customize AI Page
     settings = get_user_settings(To)
     
-    # Check Master Switch
     if settings.get("ai_active") == 0:
         response = VoiceResponse()
-        response.say("The clinic is currently unavailable. Please call back later.")
+        encoded_offline = urllib.parse.quote("The clinic is currently unavailable. Please call back later.")
+        response.play(f"{PUBLIC_URL}/voice/tts?text={encoded_offline}")
         response.hangup()
         return HTMLResponse(content=str(response), media_type="application/xml")
 
-    # Fetch User's Custom Prompt and Greeting
     custom_prompt = settings.get("system_prompt") or "You are a helpful receptionist. Keep answers to 1-2 sentences."
     greeting = settings.get("greeting") or "Hello, how can I help you today?"
 
-    # Force the AI to be conversational over the phone
     full_system_prompt = f"{custom_prompt}\n\nCRITICAL RULE: You are talking on the phone. Do not use bullet points or markdown. Keep your responses conversational, warm, and very brief (1-3 sentences maximum). Ask one question at a time."
 
-    # Initialize memory for this specific call
     active_calls[CallSid] = [
         {"role": "system", "content": full_system_prompt},
         {"role": "assistant", "content": greeting}
@@ -113,9 +125,10 @@ async def handle_incoming_call(CallSid: str = Form(...), From: str = Form(...), 
 
     print(f"📞 INCOMING CALL: {From} to {To}. Playing greeting.")
 
-    # TwiML to speak the custom greeting, then listen for user speech
+    # Convert greeting to realistic human audio
+    encoded_greeting = urllib.parse.quote(greeting)
     response = VoiceResponse()
-    response.say(greeting, voice="Polly.Joanna-Neural")
+    response.play(f"{PUBLIC_URL}/voice/tts?text={encoded_greeting}")
     response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="auto")
     
     return HTMLResponse(content=str(response), media_type="application/xml")
@@ -126,26 +139,24 @@ async def process_speech(CallSid: str = Form(...), SpeechResult: str = Form(None
     """Twilio sends the transcribed user speech here."""
     response = VoiceResponse()
 
-    # If the user was silent, prompt them again
     if not SpeechResult:
-        response.say("I'm sorry, I didn't catch that. Could you repeat it?", voice="Polly.Joanna-Neural")
+        encoded_retry = urllib.parse.quote("I'm sorry, I didn't catch that. Could you repeat it?")
+        response.play(f"{PUBLIC_URL}/voice/tts?text={encoded_retry}")
         response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="auto")
         return HTMLResponse(content=str(response), media_type="application/xml")
 
     print(f"🗣️ USER SAID: {SpeechResult}")
 
     history = active_calls.get(CallSid)
-    if not history: # Fallback if call drops memory
+    if not history: 
         response.hangup()
         return HTMLResponse(content=str(response), media_type="application/xml")
 
-    # Add user speech to memory
     history.append({"role": "user", "content": SpeechResult})
 
-    # Ask Groq how to reply
     try:
         ai_completion = await groq_client.chat.completions.create(
-            model="llama-3.1-8b-instant", # Free, blazing fast model
+            model="llama-3.1-8b-instant", 
             messages=history
         )
         ai_reply = ai_completion.choices[0].message.content
@@ -154,13 +165,15 @@ async def process_speech(CallSid: str = Form(...), SpeechResult: str = Form(None
 
         print(f"🤖 AI REPLIED: {ai_reply}")
 
-        # Tell Twilio to speak the reply and listen again
-        response.say(ai_reply, voice="Polly.Joanna-Neural")
+        # Convert AI reply to realistic human audio
+        encoded_reply = urllib.parse.quote(ai_reply)
+        response.play(f"{PUBLIC_URL}/voice/tts?text={encoded_reply}")
         response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="auto")
         
     except Exception as e:
         print(f"❌ Groq Error: {e}")
-        response.say("I'm having a little trouble connecting. Please hold.", voice="Polly.Joanna-Neural")
+        encoded_error = urllib.parse.quote("I'm having a little trouble connecting. Please hold.")
+        response.play(f"{PUBLIC_URL}/voice/tts?text={encoded_error}")
 
     return HTMLResponse(content=str(response), media_type="application/xml")
 
@@ -176,11 +189,9 @@ async def call_status_update(CallSid: str = Form(...), CallStatus: str = Form(..
             print("📞 Call ended before conversation happened.")
             return {"status": "ignored"}
 
-        # Build raw transcript
         transcript = "\n".join([f"{msg['role'].upper()}: {msg['content']}" for msg in history if msg['role'] != 'system'])
         print(f"📞 CALL ENDED. Extracting data...\n")
 
-        # --- FORCE GROQ TO EXTRACT THE DATA IN JSON MODE ---
         try:
             extraction_prompt = f"""
             Read the following call transcript. Extract the caller's full name and the appointment time they requested.
@@ -209,7 +220,6 @@ async def call_status_update(CallSid: str = Form(...), CallStatus: str = Form(..
 
             print(f"🎯 EXTRACTION SUCCESS: Name: {client_name}, Time: {appt_time}")
 
-            # --- SAVE TO DATABASE ---
             conn = get_db_connection()
             if conn:
                 try:
@@ -298,7 +308,7 @@ async def accept_schedule(call_sid: str, req: Request):
         conn.commit()
         if caller_phone:
             twilio_client.messages.create(
-                body=f"Your appointment with Verity Law for {appt_time} is confirmed.",
+                body=f"Your appointment with Wellness Partners for {appt_time} is confirmed.",
                 from_=TWILIO_NUMBER, to=caller_phone
             )
         return {"ok": True}
