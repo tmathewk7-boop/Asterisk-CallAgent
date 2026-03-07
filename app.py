@@ -214,12 +214,11 @@ async def call_status_update(CallSid: str = Form(...), CallStatus: str = Form(..
         
             extraction_prompt = f"""
             Today's date is {current_date}. Read the following call transcript. 
-            Extract the caller's full name and the specific appointment time they requested.
+            1. Extract the caller's full name.
+            2. Did the caller ask for an appointment, a callback, to speak to a human (like a lawyer), or leave a message for someone? If yes, set "needs_callback" to true.
+            3. If they requested a specific time, format "appointment_time" strictly as "YYYY-MM-DD HH:MM AM/PM". If they just asked for a callback without a specific time, set it to "ASAP".
         
-            CRITICAL: Format the "appointment_time" strictly as "YYYY-MM-DD HH:MM AM/PM". 
-            Do not use conversational dates like "next Wednesday". Calculate the exact date.
-        
-            Return ONLY a valid JSON object with the exact keys: "client_name", "appointment_time", and "summary".
+            Return ONLY a valid JSON object with the exact keys: "client_name", "appointment_time", "needs_callback" (boolean), and "summary".
         
             Transcript:
             {transcript}
@@ -234,13 +233,20 @@ async def call_status_update(CallSid: str = Form(...), CallStatus: str = Form(..
             data = json.loads(ext_completion.choices[0].message.content)
             
             client_name = data.get("client_name") or "Unknown"
+            needs_callback = data.get("needs_callback", False)
             appt_time = data.get("appointment_time")
+            
+            # If they didn't give a time but need a callback, label it ASAP
+            if needs_callback and not appt_time:
+                appt_time = "ASAP"
+                
             summary = data.get("summary", "No summary provided")
             safe_summary = summary[:250] + "..." if len(summary) > 250 else summary
             
-            appt_status = "pending" if appt_time else "none"
+            # Now it triggers 'pending' if they set a time OR just asked for a human
+            appt_status = "pending" if (appt_time or needs_callback) else "none"
 
-            print(f"🎯 EXTRACTION SUCCESS: Name: {client_name}, Time: {appt_time}")
+            print(f"🎯 EXTRACTION SUCCESS: Name: {client_name}, Time: {appt_time}, Status: {appt_status}")
 
             conn = get_db_connection()
             if conn:
@@ -321,21 +327,25 @@ async def get_schedule_requests(system_number: str):
 async def accept_schedule(call_sid: str, req: Request):
     data = await req.json()
     caller_phone = data.get("caller_phone")
+    # This grabs the time you picked on your Windows dashboard!
+    confirmed_time = data.get("confirmed_time", "your requested time") 
+    
     conn = get_db_connection()
     try:
         with conn.cursor() as c:
-            c.execute("UPDATE calls SET appointment_status='accepted' WHERE call_sid=%s", (call_sid,))
-            c.execute("SELECT appointment_time FROM calls WHERE call_sid=%s", (call_sid,))
-            appt_time = (c.fetchone() or {}).get('appointment_time', "your requested time")
+            # Save the new confirmed time to the database
+            c.execute("UPDATE calls SET appointment_status='accepted', appointment_time=%s WHERE call_sid=%s", (confirmed_time, call_sid,))
         conn.commit()
+        
         if caller_phone:
             twilio_client.messages.create(
-                body=f"Your appointment with Wellness Partners for {appt_time} is confirmed.",
+                body=f"Your callback request with VerityLink is confirmed for: {confirmed_time}.",
                 from_=TWILIO_NUMBER, to=caller_phone
             )
         return {"ok": True}
-    finally: conn.close()
-
+    finally: 
+        conn.close()
+        
 @app.post("/api/schedule/reject/{call_sid}")
 async def reject_schedule(call_sid: str):
     conn = get_db_connection()
