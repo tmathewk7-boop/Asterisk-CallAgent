@@ -327,22 +327,32 @@ async def get_schedule_requests(system_number: str):
 async def accept_schedule(call_sid: str, req: Request):
     data = await req.json()
     caller_phone = data.get("caller_phone")
-    # This grabs the time you picked on your Windows dashboard!
     confirmed_time = data.get("confirmed_time", "your requested time") 
     
     conn = get_db_connection()
     try:
         with conn.cursor() as c:
-            # Save the new confirmed time to the database
+            # 1. Update the database first
             c.execute("UPDATE calls SET appointment_status='accepted', appointment_time=%s WHERE call_sid=%s", (confirmed_time, call_sid,))
         conn.commit()
         
+        # 2. Try to send the SMS safely
+        sms_sent = False
+        error_msg = None
         if caller_phone:
-            twilio_client.messages.create(
-                body=f"Your callback request with VerityLink is confirmed for: {confirmed_time}.",
-                from_=TWILIO_NUMBER, to=caller_phone
-            )
-        return {"ok": True}
+            try:
+                twilio_client.messages.create(
+                    body=f"Your callback request with VerityLink is confirmed for: {confirmed_time}.",
+                    from_=TWILIO_NUMBER, to=caller_phone
+                )
+                sms_sent = True
+            except Exception as e:
+                print(f"⚠️ TWILIO SMS BLOCKED: {e}")
+                error_msg = str(e)
+                
+        # 3. Tell the dashboard it succeeded, but pass along the Twilio warning if it happened
+        return {"ok": True, "sms_sent": sms_sent, "error": error_msg}
+        
     finally: 
         conn.close()
         
