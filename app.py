@@ -197,13 +197,12 @@ async def process_speech(CallSid: str = Form(...), SpeechResult: str = Form(None
 # ---------------- 3. POST-CALL EXTRACTION & SAVING ----------------
 @app.post("/voice/status")
 async def call_status_update(CallSid: str = Form(...), CallStatus: str = Form(...), From: str = Form(...), To: str = Form(...)):
-    """Twilio hits this when the call disconnects. We extract data and save to DB."""
+    """Twilio hits this when the call disconnects. We extract data and route to the correct lawyer and role."""
     
     if CallStatus in ["completed", "failed", "busy", "no-answer", "canceled"]:
         history = active_calls.pop(CallSid, None)
         
         if not history or len(history) <= 2:
-            print("📞 Call ended before conversation happened.")
             return {"status": "ignored"}
 
         transcript = "\n".join([f"{msg['role'].upper()}: {msg['content']}" for msg in history if msg['role'] != 'system'])
@@ -212,13 +211,16 @@ async def call_status_update(CallSid: str = Form(...), CallStatus: str = Form(..
         try:
             current_date = datetime.datetime.now().strftime('%Y-%m-%d')
         
+            # 🔥 UPGRADED PROMPT: Now extracts both the Lawyer Name AND the Practice Area (Role)
             extraction_prompt = f"""
             Today's date is {current_date}. Read the following call transcript. 
             1. Extract the caller's full name.
-            2. Did the caller ask for an appointment, a callback, to speak to a human (like a lawyer), or leave a message for someone? If yes, set "needs_callback" to true.
-            3. If they requested a specific time, format "appointment_time" strictly as "YYYY-MM-DD HH:MM AM/PM". If they just asked for a callback without a specific time, set it to "ASAP".
+            2. Did the caller ask for an appointment, a callback, or to speak to someone? If yes, set "needs_callback" to true.
+            3. If they requested a specific time, format "appointment_time" strictly as "YYYY-MM-DD HH:MM AM/PM". If no time given but they need a callback, set it to "ASAP".
+            4. ROUTING (NAME): Identify which specific lawyer or person they want to speak to (e.g., "Mr. Smith", "Davis"). If they don't specify a name, set it to "General".
+            5. ROUTING (ROLE): Identify the legal role or practice area the caller needs based on their issue (e.g., "Divorce Lawyer", "Financial Lawyer", "Criminal Defense"). If it's a general inquiry or unclear, set it to "General".
         
-            Return ONLY a valid JSON object with the exact keys: "client_name", "appointment_time", "needs_callback" (boolean), and "summary".
+            Return ONLY a valid JSON object with exact keys: "client_name", "appointment_time", "needs_callback" (boolean), "summary", "assigned_lawyer", and "assigned_role".
         
             Transcript:
             {transcript}
@@ -235,50 +237,52 @@ async def call_status_update(CallSid: str = Form(...), CallStatus: str = Form(..
             client_name = data.get("client_name") or "Unknown"
             needs_callback = data.get("needs_callback", False)
             appt_time = data.get("appointment_time")
+            assigned_lawyer = data.get("assigned_lawyer", "General") 
+            assigned_role = data.get("assigned_role", "General") # The new Role variable!
             
-            # If they didn't give a time but need a callback, label it ASAP
             if needs_callback and not appt_time:
                 appt_time = "ASAP"
                 
             summary = data.get("summary", "No summary provided")
             safe_summary = summary[:250] + "..." if len(summary) > 250 else summary
             
-            # Now it triggers 'pending' if they set a time OR just asked for a human
             appt_status = "pending" if (appt_time or needs_callback) else "none"
 
-            print(f"🎯 EXTRACTION SUCCESS: Name: {client_name}, Time: {appt_time}, Status: {appt_status}")
+            print(f"🎯 ROUTED TO: {assigned_lawyer} ({assigned_role}) | Name: {client_name}")
 
             conn = get_db_connection()
             if conn:
                 try:
                     with conn.cursor() as c:
+                        # 🔥 UPGRADED SQL: Saves BOTH the assigned_lawyer and assigned_role
                         c.execute("""
                             INSERT INTO calls (
                                 call_sid, phone_number, system_number,
                                 timestamp, client_name, summary, full_transcript,
-                                appointment_time, appointment_status
+                                appointment_time, appointment_status, assigned_lawyer, assigned_role
                             )
-                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
                             ON DUPLICATE KEY UPDATE
                                 summary=VALUES(summary),
                                 full_transcript=VALUES(full_transcript),
                                 appointment_time=VALUES(appointment_time),
                                 appointment_status=VALUES(appointment_status),
-                                client_name=VALUES(client_name)
+                                client_name=VALUES(client_name),
+                                assigned_lawyer=VALUES(assigned_lawyer),
+                                assigned_role=VALUES(assigned_role)
                         """, (
                             CallSid, From, To, datetime.datetime.now(datetime.timezone.utc),
-                            client_name, safe_summary, transcript, appt_time, appt_status
+                            client_name, safe_summary, transcript, appt_time, appt_status, assigned_lawyer, assigned_role
                         ))
                     conn.commit()
-                    print(f"✅ SUCCESS: Saved to dashboard!")
                 finally:
                     conn.close()
 
         except Exception as e:
-            print(f"❌ Extraction/DB Error: {e}")
+            print(f"❌ Extraction Error: {e}")
 
     return {"status": "received"}
-
+    
 # ---------------- DASHBOARD API ENDPOINTS ----------------
 class DeleteCallsRequest(BaseModel):
     call_sids: list[str]
@@ -297,29 +301,47 @@ async def delete_calls(req: DeleteCallsRequest):
     finally: conn.close()
 
 @app.get("/api/calls/{system_number}")
-async def get_calls(system_number: str):
+async def get_calls(system_number: str, lawyer: str = None):
+    """🔥 UPGRADED: Now accepts a lawyer's name and filters the results!"""
     conn = get_db_connection()
     if not conn: return []
     try:
         with conn.cursor() as c:
-            c.execute("SELECT * FROM calls")
+            if lawyer and lawyer.lower() != "admin":
+                # Only grab calls meant for this specific lawyer or "General" firm calls
+                c.execute("SELECT * FROM calls WHERE system_number=%s AND (assigned_lawyer LIKE %s OR assigned_lawyer='General')", (system_number, f"%{lawyer}%"))
+            else:
+                c.execute("SELECT * FROM calls WHERE system_number=%s", (system_number,))
+                
             valid_rows = [r for r in c.fetchall() if isinstance(r.get("timestamp"), datetime.datetime)]
             valid_rows.sort(key=lambda r: r["timestamp"], reverse=True)
             return [normalize_call(r) for r in valid_rows[:50]]
     finally: conn.close()
 
 @app.get("/api/schedule/requests/{system_number}")
-async def get_schedule_requests(system_number: str):
+async def get_schedule_requests(system_number: str, lawyer: str = None):
+    """🔥 UPGRADED: Now filters appointment requests by the lawyer's name!"""
     conn = get_db_connection()
     if not conn: return []
     try:
         with conn.cursor() as c:
-            c.execute("""
-                SELECT call_sid as request_id, phone_number as caller_phone,
-                       client_name as caller_name, timestamp,
-                       appointment_time as requested_time_str, summary as reason
-                FROM calls WHERE appointment_status='pending' ORDER BY timestamp DESC
-            """)
+            if lawyer and lawyer.lower() != "admin":
+                c.execute("""
+                    SELECT call_sid as request_id, phone_number as caller_phone,
+                           client_name as caller_name, timestamp,
+                           appointment_time as requested_time_str, summary as reason
+                    FROM calls WHERE appointment_status='pending' AND system_number=%s 
+                    AND (assigned_lawyer LIKE %s OR assigned_lawyer='General')
+                    ORDER BY timestamp DESC
+                """, (system_number, f"%{lawyer}%"))
+            else:
+                c.execute("""
+                    SELECT call_sid as request_id, phone_number as caller_phone,
+                           client_name as caller_name, timestamp,
+                           appointment_time as requested_time_str, summary as reason
+                    FROM calls WHERE appointment_status='pending' AND system_number=%s 
+                    ORDER BY timestamp DESC
+                """, (system_number,))
             return c.fetchall()
     finally: conn.close()
 
