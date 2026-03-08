@@ -144,7 +144,7 @@ async def handle_incoming_call(CallSid: str = Form(...), From: str = Form(...), 
     encoded_greeting = urllib.parse.quote(greeting)
     response = VoiceResponse()
     # Nesting Play inside Gather allows for instant human interruption (Barge-In)
-    gather = response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="1", bargeIn="true", profanityFilter="false")
+    gather = response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="1", bargeIn="true")
     gather.play(f"{PUBLIC_URL}/voice/tts?text={encoded_greeting}") # Or encoded_greeting for the incoming route
     
     return HTMLResponse(content=str(response), media_type="application/xml")
@@ -187,7 +187,7 @@ async def process_speech(CallSid: str = Form(...), SpeechResult: str = Form(None
         # Convert AI reply to realistic human audio
         encoded_reply = urllib.parse.quote(ai_reply)
         # Nesting Play inside Gather allows for instant human interruption (Barge-In)
-        gather = response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="1", bargeIn="true", profanityFilter="false")
+        gather = response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="1", bargeIn="true")
         gather.play(f"{PUBLIC_URL}/voice/tts?text={encoded_reply}") # Or encoded_greeting for the incoming route
         
     except Exception as e:
