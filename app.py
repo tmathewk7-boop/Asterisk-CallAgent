@@ -131,7 +131,7 @@ async def handle_incoming_call(CallSid: str = Form(...), From: str = Form(...), 
     custom_prompt = settings.get("system_prompt") or "You are a helpful receptionist. Keep answers to 1-2 sentences."
     greeting = settings.get("greeting") or "Hello, how can I help you today?"
 
-    full_system_prompt = f"{custom_prompt}\n\nCRITICAL RULE: You are talking on the phone. Do not use bullet points or markdown. Keep your responses conversational, warm, and very brief (1-3 sentences maximum). Ask one question at a time."
+    full_system_prompt = f"{custom_prompt}\n\nCRITICAL RULE: You are on a live phone call. Keep your responses UNDER 25 WORDS. Be conversational, punchy, and brief. Never use lists. Ask only one question at a time."
 
     active_calls[CallSid] = [
         {"role": "system", "content": full_system_prompt},
@@ -144,7 +144,7 @@ async def handle_incoming_call(CallSid: str = Form(...), From: str = Form(...), 
     encoded_greeting = urllib.parse.quote(greeting)
     response = VoiceResponse()
     # Nesting Play inside Gather allows for instant human interruption (Barge-In)
-    gather = response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="auto", bargeIn="true")
+    gather = response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="1", bargeIn="true", profanityFilter="false")
     gather.play(f"{PUBLIC_URL}/voice/tts?text={encoded_greeting}") # Or encoded_greeting for the incoming route
     
     return HTMLResponse(content=str(response), media_type="application/xml")
@@ -173,7 +173,10 @@ async def process_speech(CallSid: str = Form(...), SpeechResult: str = Form(None
     try:
         ai_completion = await groq_client.chat.completions.create(
             model="llama-3.1-8b-instant", 
-            messages=history
+            messages=history,
+            max_tokens=100,  # Forces Groq to process and return instantly
+            temperature=0.6  # Keeps the AI from hesitating/hallucinating
+        )
         )
         ai_reply = ai_completion.choices[0].message.content
         history.append({"role": "assistant", "content": ai_reply})
@@ -184,7 +187,7 @@ async def process_speech(CallSid: str = Form(...), SpeechResult: str = Form(None
         # Convert AI reply to realistic human audio
         encoded_reply = urllib.parse.quote(ai_reply)
         # Nesting Play inside Gather allows for instant human interruption (Barge-In)
-        gather = response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="auto", bargeIn="true")
+        gather = response.gather(input="speech", action=f"{PUBLIC_URL}/voice/process", method="POST", speechTimeout="1", bargeIn="true", profanityFilter="false")
         gather.play(f"{PUBLIC_URL}/voice/tts?text={encoded_reply}") # Or encoded_greeting for the incoming route
         
     except Exception as e:
